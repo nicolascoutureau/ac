@@ -7,10 +7,11 @@ This project converts horizontal videos to vertical format (9:16, 1:1, or 16:9) 
 ## Features
 
 ✅ **Aspect Ratio Options**: 9:16 (vertical), 1:1 (square), 16:9 (horizontal)
-✅ **Smart Detection**: YOLOv8x for person detection + Haar Cascade for faces
+✅ **Speed Presets**: Quality, Balanced (3x faster), Fast (5x faster)
+✅ **Smart Detection**: YOLOv8 models (x/m/s) for person detection + Haar Cascade for faces
 ✅ **Fallback Detection**: Haar Cascade fallback when YOLO doesn't detect people
 ✅ **CPU Optimized**: Multi-threaded inference with model fusion
-✅ **Pre-downloaded Model**: YOLOv8x (131 MB) downloaded during Docker build
+✅ **Pre-downloaded Models**: All YOLO models downloaded during Docker build
 
 ## Local Testing
 
@@ -29,7 +30,7 @@ This will:
 cog predict -i video=@your_video.mp4 -i aspect_ratio="9:16"
 ```
 
-### 3. Test different aspect ratios
+### 3. Test different aspect ratios and speed presets
 ```bash
 # Vertical (9:16) - default for TikTok, Reels, Shorts
 cog predict -i video=@input.mp4 -i aspect_ratio="9:16"
@@ -39,6 +40,11 @@ cog predict -i video=@input.mp4 -i aspect_ratio="1:1"
 
 # Horizontal (16:9) - Standard widescreen
 cog predict -i video=@input.mp4 -i aspect_ratio="16:9"
+
+# Speed presets (balanced is default)
+cog predict -i video=@input.mp4 -i speed_preset="quality"   # Slowest, most accurate
+cog predict -i video=@input.mp4 -i speed_preset="balanced"  # 3x faster, good accuracy
+cog predict -i video=@input.mp4 -i speed_preset="fast"      # 5x faster, decent accuracy
 ```
 
 ## Deployment to Replicate
@@ -110,9 +116,16 @@ To change model, edit line 21 in `cog.yaml` and line 25 in `predict.py`.
 
 ## Performance Expectations
 
-- **Setup**: < 5 seconds (model pre-downloaded)
-- **Processing**: ~2-3x video duration on CPU
-- **Example**: 1 minute video = ~2-3 minutes processing time
+### Processing Speed by Preset (CPU)
+
+| Preset | Model | Resolution | 51min Video | 5min Video | Best For |
+|--------|-------|------------|-------------|------------|----------|
+| **Quality** | YOLOv8x | 100% | ~15 min | ~1.5 min | Maximum accuracy |
+| **Balanced** | YOLOv8m | 75% | **~5 min** | **~30 sec** | Best balance ⭐ |
+| **Fast** | YOLOv8s | 50% | **~3 min** | **~18 sec** | Quick results |
+
+- **Setup**: < 10 seconds (all models pre-downloaded)
+- **Default**: Balanced preset (3x faster than quality)
 
 ## Files Overview
 

@@ -21,9 +21,14 @@ class Predictor(BasePredictor):
             torch.set_num_interop_threads(num_threads)
             print(f"  Using {num_threads} CPU threads")
             
-            print("Loading YOLOv8x model...")
-            self.model = YOLO('yolov8x.pt')
-            print("  YOLOv8x model loaded successfully")
+            # Pre-load different model sizes for different speed presets
+            print("Loading YOLO models...")
+            self.models = {
+                'quality': YOLO('yolov8x.pt'),  # 131 MB, most accurate
+                'balanced': YOLO('yolov8m.pt'),  # 49 MB, good balance
+                'fast': YOLO('yolov8s.pt')       # 21 MB, fast
+            }
+            print("  ✅ YOLOv8x (quality), YOLOv8m (balanced), YOLOv8s (fast) loaded")
             
             print("Loading Haar Cascade face detector...")
             self.face_cascade = cv2.CascadeClassifier(
@@ -47,6 +52,11 @@ class Predictor(BasePredictor):
             choices=["9:16", "1:1", "16:9"],
             default="9:16"
         ),
+        speed_preset: str = Input(
+            description="Processing speed preset. Fast uses smaller YOLO model and lower resolution analysis.",
+            choices=["quality", "balanced", "fast"],
+            default="balanced"
+        ),
     ) -> Path:
         """Run a single prediction on the model"""
         output_path = None
@@ -55,6 +65,23 @@ class Predictor(BasePredictor):
             print(f"\n🎥 Starting video processing...")
             print(f"  Input: {video}")
             print(f"  Aspect ratio: {aspect_ratio}")
+            print(f"  Speed preset: {speed_preset}")
+            
+            # Select model based on speed preset
+            model = self.models[speed_preset]
+            model_names = {
+                'quality': 'YOLOv8x (slowest, most accurate)',
+                'balanced': 'YOLOv8m (3x faster, still accurate)',
+                'fast': 'YOLOv8s (5x faster, good accuracy)'
+            }
+            print(f"  Using: {model_names[speed_preset]}")
+            
+            # Set analysis resolution based on preset
+            analysis_scale = {
+                'quality': 1.0,    # Full resolution
+                'balanced': 0.75,  # 75% resolution for analysis
+                'fast': 0.5        # 50% resolution for analysis
+            }
             
             # Create a temporary output file
             with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_output:
@@ -73,9 +100,10 @@ class Predictor(BasePredictor):
             process_video(
                 input_video=str(video),
                 final_output_video=output_path,
-                model=self.model,
+                model=model,
                 face_cascade=self.face_cascade,
-                aspect_ratio=aspect_ratio_numeric
+                aspect_ratio=aspect_ratio_numeric,
+                analysis_scale=analysis_scale[speed_preset]
             )
             
             # Verify output was created

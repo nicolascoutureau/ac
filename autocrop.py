@@ -10,10 +10,13 @@ from tqdm import tqdm
 import threading
 import queue
 
-def analyze_scene_content(video_path, scene_start_time, scene_end_time, model, face_cascade, dnn_face_detector=None):
+def analyze_scene_content(video_path, scene_start_time, scene_end_time, model, face_cascade, analysis_scale=1.0, dnn_face_detector=None):
     """
     Analyzes the middle frame of a scene to detect people and faces.
     Uses fallback detection if primary method doesn't find anything.
+    
+    Args:
+        analysis_scale: Scale factor for analysis (e.g., 0.5 = half resolution). Lower = faster but less accurate.
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -34,7 +37,19 @@ def analyze_scene_content(video_path, scene_start_time, scene_end_time, model, f
         return []
 
     frame_height, frame_width = frame.shape[:2]
-    results = model([frame], verbose=False)
+    
+    # Resize frame for faster analysis if scale < 1.0
+    if analysis_scale < 1.0:
+        analysis_width = int(frame_width * analysis_scale)
+        analysis_height = int(frame_height * analysis_scale)
+        analysis_frame = cv2.resize(frame, (analysis_width, analysis_height), interpolation=cv2.INTER_LINEAR)
+        scale_back_x = frame_width / analysis_width
+        scale_back_y = frame_height / analysis_height
+    else:
+        analysis_frame = frame
+        scale_back_x = scale_back_y = 1.0
+    
+    results = model([analysis_frame], verbose=False)
     
     detected_objects = []
 
@@ -44,8 +59,16 @@ def analyze_scene_content(video_path, scene_start_time, scene_end_time, model, f
         for box in boxes:
             if box.cls[0] == 0:  # Person class
                 x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
+                
+                # Scale bounding box back to original resolution if needed
+                x1 = int(x1 * scale_back_x)
+                y1 = int(y1 * scale_back_y)
+                x2 = int(x2 * scale_back_x)
+                y2 = int(y2 * scale_back_y)
+                
                 person_box = [x1, y1, x2, y2]
                 
+                # Detect face within person box on original resolution frame
                 person_roi_gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
                 faces = face_cascade.detectMultiScale(person_roi_gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
                 
@@ -146,7 +169,7 @@ def get_video_resolution(video_path):
     return width, height
 
 
-def process_video(input_video, final_output_video, model, face_cascade, aspect_ratio=9/16):
+def process_video(input_video, final_output_video, model, face_cascade, aspect_ratio=9/16, analysis_scale=1.0):
     """
     Main video processing function that converts horizontal video to vertical format.
     
@@ -156,6 +179,7 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
         model: YOLO model instance
         face_cascade: Haar Cascade face detector instance
         aspect_ratio: Target aspect ratio (width/height), default is 9/16 for vertical video
+        analysis_scale: Scale factor for scene analysis (e.g., 0.5 = half resolution for faster processing)
     """
     script_start_time = time.time()
     
@@ -196,7 +220,7 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
 
     scenes_analysis = []
     for i, (start_time, end_time) in enumerate(tqdm(scenes, desc="Analyzing Scenes")):
-        analysis = analyze_scene_content(input_video, start_time, end_time, model, face_cascade)
+        analysis = analyze_scene_content(input_video, start_time, end_time, model, face_cascade, analysis_scale)
         strategy, target_box = decide_cropping_strategy(analysis, original_height, aspect_ratio)
         scenes_analysis.append({
             'start_frame': start_time.get_frames(),
