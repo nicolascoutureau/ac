@@ -3,7 +3,11 @@
 
 build:
   # set to true if your model requires a GPU
-  gpu: false
+  gpu: true
+  # GPU support enables:
+  # - NVIDIA CUDA for YOLO inference (10-20x faster)
+  # - h264_nvenc hardware encoding (3-5x faster)
+  # Note: Falls back to CPU automatically if no GPU available
 
   # a list of ubuntu apt packages to install
   system_packages:

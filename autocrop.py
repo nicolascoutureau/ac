@@ -169,7 +169,21 @@ def get_video_resolution(video_path):
     return width, height
 
 
-def process_video(input_video, final_output_video, model, face_cascade, aspect_ratio=9/16, analysis_scale=1.0):
+def get_video_codec(video_path):
+    """Detect the video codec using ffprobe"""
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1',
+            video_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return result.stdout.strip()
+    except:
+        return None
+
+
+def process_video(input_video, final_output_video, model, face_cascade, aspect_ratio=9/16, analysis_scale=1.0, use_gpu=False):
     """
     Main video processing function that converts horizontal video to vertical format.
     
@@ -180,6 +194,7 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
         face_cascade: Haar Cascade face detector instance
         aspect_ratio: Target aspect ratio (width/height), default is 9/16 for vertical video
         analysis_scale: Scale factor for scene analysis (e.g., 0.5 = half resolution for faster processing)
+        use_gpu: Whether GPU is available for hardware acceleration
     """
     script_start_time = time.time()
     
@@ -243,22 +258,66 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
     print("\n✂️ Step 4: Processing video frames...")
     step_start_time = time.time()
     
-    # Use ultrafast preset to prevent FFmpeg from becoming the bottleneck
-    command = [
-        'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
-        '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
-        '-r', str(fps), '-i', '-', '-c:v', 'libx264',
-        '-preset', 'ultrafast', '-crf', '23', '-an', temp_video_output
-    ]
+    # Build FFmpeg command with hardware acceleration if available
+    if use_gpu:
+        print("  🚀 Using NVIDIA GPU hardware encoding (h264_nvenc)...")
+        command = [
+            'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
+            '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
+            '-r', str(fps), '-i', '-',
+            '-c:v', 'h264_nvenc',          # NVIDIA hardware encoder
+            '-preset', 'p4',                # P4 preset (balanced quality/speed)
+            '-tune', 'hq',                  # High quality tuning
+            '-rc', 'vbr',                   # Variable bitrate
+            '-rc-lookahead', '20',          # Lookahead for better quality
+            '-spatial_aq', '1',             # Spatial adaptive quantization
+            '-temporal_aq', '1',            # Temporal adaptive quantization
+            '-cq', '23',                    # Quality level (like CRF)
+            '-b:v', '0',                    # Use quality target instead of bitrate
+            '-g', str(int(fps * 2)),        # Keyframe every 2 seconds
+            '-bf', '3',                     # B-frames for better compression
+            '-movflags', '+faststart',      # Fast start for web playback
+            '-an', temp_video_output
+        ]
+    else:
+        print("  💻 Using CPU software encoding (libx264)...")
+        command = [
+            'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
+            '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
+            '-r', str(fps), '-i', '-',
+            '-c:v', 'libx264',              # CPU software encoder
+            '-preset', 'ultrafast',         # Fastest CPU preset
+            '-crf', '23',                   # Quality level
+            '-an', temp_video_output
+        ]
 
     # Large buffer to prevent pipe deadlocks
-    ffmpeg_process = subprocess.Popen(
-        command, 
-        stdin=subprocess.PIPE, 
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=10**8  # 100MB buffer
-    )
+    try:
+        ffmpeg_process = subprocess.Popen(
+            command, 
+            stdin=subprocess.PIPE, 
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=10**8  # 100MB buffer
+        )
+    except FileNotFoundError:
+        if use_gpu:
+            print("  ⚠️  h264_nvenc not available, falling back to CPU encoding...")
+            use_gpu = False  # Disable GPU for this session
+            command = [
+                'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
+                '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
+                '-r', str(fps), '-i', '-',
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast', '-crf', '23', '-an', temp_video_output
+            ]
+            ffmpeg_process = subprocess.Popen(
+                command, 
+                stdin=subprocess.PIPE, 
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=10**8
+            )
     
     # Thread to consume stderr and prevent blocking
     stderr_lines = []

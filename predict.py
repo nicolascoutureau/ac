@@ -14,21 +14,35 @@ class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
         try:
-            # Enable CPU optimizations
-            print("Enabling CPU optimizations...")
-            num_threads = os.cpu_count() or 4
-            torch.set_num_threads(num_threads)
-            torch.set_num_interop_threads(num_threads)
-            print(f"  Using {num_threads} CPU threads")
+            # Detect hardware acceleration availability
+            self.has_gpu = torch.cuda.is_available()
+            self.device = 'cuda:0' if self.has_gpu else 'cpu'
+            
+            if self.has_gpu:
+                print(f"🚀 GPU detected: {torch.cuda.get_device_name(0)}")
+                print(f"   CUDA version: {torch.version.cuda}")
+                print(f"   GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+            else:
+                print("💻 No GPU detected, using CPU")
+                # Enable CPU optimizations
+                num_threads = os.cpu_count() or 4
+                torch.set_num_threads(num_threads)
+                torch.set_num_interop_threads(num_threads)
+                print(f"  Using {num_threads} CPU threads")
             
             # Pre-load different model sizes for different speed presets
-            print("Loading YOLO models...")
+            print(f"Loading YOLO models on {self.device}...")
             self.models = {
                 'quality': YOLO('yolov8x.pt'),  # 131 MB, most accurate
                 'balanced': YOLO('yolov8m.pt'),  # 49 MB, good balance
                 'fast': YOLO('yolov8s.pt')       # 21 MB, fast
             }
-            print("  ✅ YOLOv8x (quality), YOLOv8m (balanced), YOLOv8s (fast) loaded")
+            
+            # Move models to GPU if available
+            for name, model in self.models.items():
+                model.to(self.device)
+            
+            print(f"  ✅ YOLOv8x (quality), YOLOv8m (balanced), YOLOv8s (fast) loaded on {self.device}")
             
             print("Loading Haar Cascade face detector...")
             self.face_cascade = cv2.CascadeClassifier(
@@ -103,7 +117,8 @@ class Predictor(BasePredictor):
                 model=model,
                 face_cascade=self.face_cascade,
                 aspect_ratio=aspect_ratio_numeric,
-                analysis_scale=analysis_scale[speed_preset]
+                analysis_scale=analysis_scale[speed_preset],
+                use_gpu=self.has_gpu
             )
             
             # Verify output was created
