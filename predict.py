@@ -1,0 +1,96 @@
+# Prediction interface for Cog ⚙️
+# https://cog.run/python
+
+from cog import BasePredictor, Input, Path
+import cv2
+from ultralytics import YOLO
+from autocrop import process_video
+import tempfile
+import os
+import torch
+
+
+class Predictor(BasePredictor):
+    def setup(self) -> None:
+        """Load the model into memory to make running multiple predictions efficient"""
+        try:
+            # Enable CPU optimizations
+            print("Enabling CPU optimizations...")
+            num_threads = os.cpu_count() or 4
+            torch.set_num_threads(num_threads)
+            torch.set_num_interop_threads(num_threads)
+            print(f"  Using {num_threads} CPU threads")
+            
+            print("Loading YOLOv8x model...")
+            self.model = YOLO('yolov8x.pt')
+            print("  YOLOv8x model loaded successfully")
+            
+            print("Loading Haar Cascade face detector...")
+            self.face_cascade = cv2.CascadeClassifier(
+                cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            )
+            
+            if self.face_cascade.empty():
+                raise RuntimeError("Failed to load Haar Cascade classifier")
+            
+            print("  Haar Cascade loaded successfully")
+            print("✅ Setup complete!")
+        except Exception as e:
+            print(f"❌ Setup failed: {str(e)}")
+            raise
+
+    def predict(
+        self,
+        video: Path = Input(description="Input horizontal video to convert to vertical format"),
+        aspect_ratio: str = Input(
+            description="Output aspect ratio",
+            choices=["9:16", "1:1", "16:9"],
+            default="9:16"
+        ),
+    ) -> Path:
+        """Run a single prediction on the model"""
+        output_path = None
+        
+        try:
+            print(f"\n🎥 Starting video processing...")
+            print(f"  Input: {video}")
+            print(f"  Aspect ratio: {aspect_ratio}")
+            
+            # Create a temporary output file
+            with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_output:
+                output_path = temp_output.name
+            
+            # Parse aspect ratio string to numeric value
+            ratio_parts = aspect_ratio.split(':')
+            aspect_ratio_numeric = int(ratio_parts[0]) / int(ratio_parts[1])
+            print(f"  Numeric aspect ratio: {aspect_ratio_numeric:.4f}")
+            
+            # Verify video file exists and is readable
+            if not os.path.exists(str(video)):
+                raise FileNotFoundError(f"Input video not found: {video}")
+            
+            # Process the video
+            process_video(
+                input_video=str(video),
+                final_output_video=output_path,
+                model=self.model,
+                face_cascade=self.face_cascade,
+                aspect_ratio=aspect_ratio_numeric
+            )
+            
+            # Verify output was created
+            if not os.path.exists(output_path):
+                raise RuntimeError("Output video file was not created")
+            
+            output_size = os.path.getsize(output_path) / (1024 * 1024)
+            print(f"\n✅ Processing complete! Output size: {output_size:.2f} MB")
+            
+            return Path(output_path)
+            
+        except Exception as e:
+            print(f"\n❌ Error during prediction: {str(e)}")
+            print(f"Error type: {type(e).__name__}")
+            # Clean up on error
+            if output_path and os.path.exists(output_path):
+                os.remove(output_path)
+            raise RuntimeError(f"Video processing failed: {str(e)}") from e
