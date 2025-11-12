@@ -174,13 +174,24 @@ def create_stacked_frame(frame, people_data, output_width, output_height, aspect
    - Each section's crop calculated with proper aspect ratio
    - Resize is 1:1 (no stretching) after correct crop
 
-3. **Smart Cropping**: Each person gets a centered crop based on their detected position
+3. **Dynamic Smart Zoom**: Each person gets optimally zoomed crop (no stretching)
 
-4. **Face Priority**: Uses face detection when available, falls back to person bounding box
+   - Zoom calculated based on person size and section dimensions
+   - Target: Person fills ~70% of their section
+   - Adapts per person (1.3x to 2.5x range)
+   - Avoids showing repetitive/overlapping areas
+   - No stretching artifacts - crop matches section aspect ratio
+   - Tighter framing on each individual person
+   - Creates more distinct sections
+   - Better engagement and clarity
 
-5. **Equal Spacing**: Each person gets equal space in their dimension
+4. **Smart Cropping**: Each person gets a centered crop based on their detected position
 
-6. **Sorted Display**: People displayed based on their original position (left-to-right)
+5. **Face Priority**: Uses face detection when available, falls back to person bounding box
+
+6. **Equal Spacing**: Each person gets equal space in their dimension
+
+7. **Sorted Display**: People displayed based on their original position (left-to-right)
 
 ## When It's Used
 

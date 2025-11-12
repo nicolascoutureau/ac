@@ -153,21 +153,115 @@ def decide_cropping_strategy(scene_analysis, frame_height, aspect_ratio):
     return 'LETTERBOX', None
 
 
-def calculate_crop_box(target_box, frame_width, frame_height, aspect_ratio):
+def calculate_crop_box(target_box, frame_width, frame_height, aspect_ratio, zoom_factor=1.0):
+    """
+    Calculate crop box centered on target with optional zoom.
+    
+    Args:
+        target_box: Bounding box [x1, y1, x2, y2]
+        frame_width: Frame width
+        frame_height: Frame height
+        aspect_ratio: Desired aspect ratio (width/height)
+        zoom_factor: How much to zoom in (1.0 = full height, 2.0 = tight on person)
+    """
     target_center_x = (target_box[0] + target_box[2]) / 2
-    crop_height = frame_height
-    crop_width = int(crop_height * aspect_ratio)
-    x1 = int(target_center_x - crop_width / 2)
-    y1 = 0
-    x2 = int(target_center_x + crop_width / 2)
-    y2 = frame_height
-    if x1 < 0:
-        x1 = 0
-        x2 = crop_width
-    if x2 > frame_width:
-        x2 = frame_width
-        x1 = frame_width - crop_width
+    target_center_y = (target_box[1] + target_box[3]) / 2
+    
+    # Apply zoom factor - higher value = tighter crop
+    if zoom_factor > 1.0:
+        # Get person dimensions
+        person_height = target_box[3] - target_box[1]
+        person_width = target_box[2] - target_box[0]
+        
+        # Calculate crop size based on person size with some padding
+        crop_height = int(person_height * zoom_factor)
+        crop_width = int(crop_height * aspect_ratio)
+        
+        # Make sure crop isn't larger than frame
+        crop_height = min(crop_height, frame_height)
+        crop_width = min(crop_width, frame_width)
+        
+        # Center on person (both X and Y)
+        y1 = int(target_center_y - crop_height / 2)
+        y2 = int(target_center_y + crop_height / 2)
+        x1 = int(target_center_x - crop_width / 2)
+        x2 = int(target_center_x + crop_width / 2)
+        
+        # Clamp to frame bounds
+        if y1 < 0:
+            y1 = 0
+            y2 = crop_height
+        if y2 > frame_height:
+            y2 = frame_height
+            y1 = frame_height - crop_height
+        if x1 < 0:
+            x1 = 0
+            x2 = crop_width
+        if x2 > frame_width:
+            x2 = frame_width
+            x1 = frame_width - crop_width
+    else:
+        # Original behavior: full height crop
+        crop_height = frame_height
+        crop_width = int(crop_height * aspect_ratio)
+        x1 = int(target_center_x - crop_width / 2)
+        y1 = 0
+        x2 = int(target_center_x + crop_width / 2)
+        y2 = frame_height
+        
+        if x1 < 0:
+            x1 = 0
+            x2 = crop_width
+        if x2 > frame_width:
+            x2 = frame_width
+            x1 = frame_width - crop_width
+    
     return x1, y1, x2, y2
+
+
+def calculate_optimal_zoom(person_box, section_width, section_height, frame_width, frame_height):
+    """
+    Calculate optimal zoom factor to fit person in section without stretching.
+    
+    Args:
+        person_box: Person bounding box [x1, y1, x2, y2]
+        section_width: Target section width
+        section_height: Target section height
+        frame_width: Original frame width
+        frame_height: Original frame height
+        
+    Returns:
+        Optimal zoom factor (1.0 = full frame, higher = tighter)
+    """
+    person_width = person_box[2] - person_box[0]
+    person_height = person_box[3] - person_box[1]
+    
+    # Calculate how much of the section we want the person to fill (60-80%)
+    target_fill = 0.7
+    
+    # Calculate section aspect ratio
+    section_aspect = section_width / section_height
+    
+    # Determine limiting dimension
+    # If person is wider relative to section aspect, width is limiting
+    person_aspect = person_width / person_height
+    
+    if person_aspect > section_aspect:
+        # Person is wide - width is limiting dimension
+        # Calculate zoom based on how much of section width person should fill
+        desired_crop_width = person_width / target_fill
+        desired_crop_height = desired_crop_width / section_aspect
+        zoom = desired_crop_height / person_height
+    else:
+        # Person is tall - height is limiting dimension
+        # Calculate zoom based on how much of section height person should fill
+        desired_crop_height = person_height / target_fill
+        zoom = desired_crop_height / person_height
+    
+    # Clamp zoom to reasonable range
+    zoom = max(1.3, min(zoom, 2.5))  # Between 1.3x and 2.5x
+    
+    return zoom
 
 
 def create_stacked_frame(frame, people_data, output_width, output_height, aspect_ratio):
@@ -194,8 +288,6 @@ def create_stacked_frame(frame, people_data, output_width, output_height, aspect
     if aspect_ratio < 0.8:  # Vertical (9:16 = 0.5625, portrait)
         # Stack vertically (top to bottom)
         section_height = output_height // num_people
-        # Each section maintains the same aspect ratio as output
-        section_aspect = output_width / section_height
         
         for i, person in enumerate(people_data):
             person_box = person['face_box'] or person['person_box']
@@ -208,8 +300,11 @@ def create_stacked_frame(frame, people_data, output_width, output_height, aspect
             actual_section_height = y_end - y_start
             actual_section_aspect = output_width / actual_section_height
             
-            # Crop person with the section's aspect ratio (not stretched)
-            crop_box = calculate_crop_box(person_box, frame_width, frame_height, actual_section_aspect)
+            # Calculate optimal zoom for this person and section
+            zoom = calculate_optimal_zoom(person_box, output_width, actual_section_height, frame_width, frame_height)
+            
+            # Crop person with dynamic zoom
+            crop_box = calculate_crop_box(person_box, frame_width, frame_height, actual_section_aspect, zoom_factor=zoom)
             person_crop = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
             
             # Resize to exact section size (maintaining aspect ratio already in crop)
@@ -233,8 +328,11 @@ def create_stacked_frame(frame, people_data, output_width, output_height, aspect
             # Each section maintains aspect ratio
             section_aspect = actual_section_width / output_height
             
-            # Crop person with the section's aspect ratio (not stretched)
-            crop_box = calculate_crop_box(person_box, frame_width, frame_height, section_aspect)
+            # Calculate optimal zoom for this person and section
+            zoom = calculate_optimal_zoom(person_box, actual_section_width, output_height, frame_width, frame_height)
+            
+            # Crop person with dynamic zoom
+            crop_box = calculate_crop_box(person_box, frame_width, frame_height, section_aspect, zoom_factor=zoom)
             person_crop = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
             
             # Resize to exact section size (maintaining aspect ratio already in crop)
@@ -252,8 +350,11 @@ def create_stacked_frame(frame, people_data, output_width, output_height, aspect
             for i, person in enumerate(people_data):
                 person_box = person['face_box'] or person['person_box']
                 
-                # Crop person with the section's aspect ratio (not stretched)
-                crop_box = calculate_crop_box(person_box, frame_width, frame_height, section_aspect)
+                # Calculate optimal zoom for this person and section
+                zoom = calculate_optimal_zoom(person_box, section_width, output_height, frame_width, frame_height)
+                
+                # Crop person with dynamic zoom
+                crop_box = calculate_crop_box(person_box, frame_width, frame_height, section_aspect, zoom_factor=zoom)
                 person_crop = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
                 
                 # Resize to exact section size
@@ -273,8 +374,9 @@ def create_stacked_frame(frame, people_data, output_width, output_height, aspect
             for i in range(2):
                 person = people_data[i]
                 person_box = person['face_box'] or person['person_box']
-                # Crop with correct aspect ratio for top sections
-                crop_box = calculate_crop_box(person_box, frame_width, frame_height, top_section_aspect)
+                # Calculate optimal zoom for top sections
+                zoom = calculate_optimal_zoom(person_box, top_section_width, section_height, frame_width, frame_height)
+                crop_box = calculate_crop_box(person_box, frame_width, frame_height, top_section_aspect, zoom_factor=zoom)
                 person_crop = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
                 person_resized = cv2.resize(person_crop, (top_section_width, section_height), interpolation=cv2.INTER_LINEAR)
                 output_frame[0:section_height, i * top_section_width:(i + 1) * top_section_width] = person_resized
@@ -282,8 +384,9 @@ def create_stacked_frame(frame, people_data, output_width, output_height, aspect
             # Bottom row: 1 person (full width)
             person = people_data[2]
             person_box = person['face_box'] or person['person_box']
-            # Crop with correct aspect ratio for bottom section
-            crop_box = calculate_crop_box(person_box, frame_width, frame_height, bottom_section_aspect)
+            # Calculate optimal zoom for bottom section
+            zoom = calculate_optimal_zoom(person_box, output_width, section_height, frame_width, frame_height)
+            crop_box = calculate_crop_box(person_box, frame_width, frame_height, bottom_section_aspect, zoom_factor=zoom)
             person_crop = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
             person_resized = cv2.resize(person_crop, (output_width, section_height), interpolation=cv2.INTER_LINEAR)
             output_frame[section_height:, :] = person_resized
@@ -291,13 +394,14 @@ def create_stacked_frame(frame, people_data, output_width, output_height, aspect
         else:  # 4 people: 2x2 grid
             section_width = output_width // 2
             section_height = output_height // 2
-            # Each grid cell is square (1:1)
+            # Each grid cell aspect
             section_aspect = section_width / section_height
             
             for i, person in enumerate(people_data):
                 person_box = person['face_box'] or person['person_box']
-                # Crop with correct aspect ratio for each grid cell
-                crop_box = calculate_crop_box(person_box, frame_width, frame_height, section_aspect)
+                # Calculate optimal zoom for each grid cell
+                zoom = calculate_optimal_zoom(person_box, section_width, section_height, frame_width, frame_height)
+                crop_box = calculate_crop_box(person_box, frame_width, frame_height, section_aspect, zoom_factor=zoom)
                 person_crop = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
                 person_resized = cv2.resize(person_crop, (section_width, section_height), interpolation=cv2.INTER_LINEAR)
                 
