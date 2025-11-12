@@ -92,8 +92,9 @@ print(output)
 1. **Scene Detection**: PySceneDetect splits video into scenes
 2. **Content Analysis**: YOLOv8x detects people, Haar Cascade detects faces
 3. **Strategy Decision**: 
-   - **TRACK**: Crops to follow detected people/faces
-   - **LETTERBOX**: Adds black bars when people are too spread out
+   - **TRACK**: Crops to follow detected people/faces (single person or close group)
+   - **STACK**: Shows multiple speakers stacked vertically (2-4 people too far apart)
+   - **LETTERBOX**: Adds black bars (5+ people or complex scenes)
 4. **Processing**: FFmpeg efficiently encodes the final video
 5. **Audio**: Original audio is preserved
 

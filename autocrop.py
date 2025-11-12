@@ -132,14 +132,25 @@ def decide_cropping_strategy(scene_analysis, frame_height, aspect_ratio):
     if num_people == 1:
         target_box = scene_analysis[0]['face_box'] or scene_analysis[0]['person_box']
         return 'TRACK', target_box
+    
+    # Multiple people detected
     person_boxes = [obj['person_box'] for obj in scene_analysis]
     group_box = get_enclosing_box(person_boxes)
     group_width = group_box[2] - group_box[0]
     max_width_for_crop = frame_height * aspect_ratio
+    
+    # If people fit horizontally, track the group
     if group_width < max_width_for_crop:
         return 'TRACK', group_box
-    else:
-        return 'LETTERBOX', None
+    
+    # If 2-4 people are too far apart, try stacking them vertically
+    if 2 <= num_people <= 4:
+        # Sort people by horizontal position (left to right)
+        sorted_people = sorted(scene_analysis, key=lambda x: x['person_box'][0])
+        return 'STACK', sorted_people
+    
+    # Too many people or they can't be stacked nicely, use letterbox
+    return 'LETTERBOX', None
 
 
 def calculate_crop_box(target_box, frame_width, frame_height, aspect_ratio):
@@ -157,6 +168,146 @@ def calculate_crop_box(target_box, frame_width, frame_height, aspect_ratio):
         x2 = frame_width
         x1 = frame_width - crop_width
     return x1, y1, x2, y2
+
+
+def create_stacked_frame(frame, people_data, output_width, output_height, aspect_ratio):
+    """
+    Create a frame with multiple people stacked based on aspect ratio.
+    
+    Args:
+        frame: Original video frame
+        people_data: List of person detection data (sorted by position)
+        output_width: Target output width
+        output_height: Target output height
+        aspect_ratio: Target aspect ratio (width/height)
+        
+    Returns:
+        Stacked frame with people arranged optimally for aspect ratio
+    """
+    frame_height, frame_width = frame.shape[:2]
+    num_people = len(people_data)
+    
+    # Create output frame
+    output_frame = np.zeros((output_height, output_width, 3), dtype=np.uint8)
+    
+    # Determine stacking strategy based on aspect ratio
+    if aspect_ratio < 0.8:  # Vertical (9:16 = 0.5625, portrait)
+        # Stack vertically (top to bottom)
+        section_height = output_height // num_people
+        # Each section maintains the same aspect ratio as output
+        section_aspect = output_width / section_height
+        
+        for i, person in enumerate(people_data):
+            person_box = person['face_box'] or person['person_box']
+            
+            # Calculate section bounds
+            y_start = i * section_height
+            y_end = y_start + section_height
+            if i == num_people - 1 and y_end < output_height:
+                y_end = output_height
+            actual_section_height = y_end - y_start
+            actual_section_aspect = output_width / actual_section_height
+            
+            # Crop person with the section's aspect ratio (not stretched)
+            crop_box = calculate_crop_box(person_box, frame_width, frame_height, actual_section_aspect)
+            person_crop = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
+            
+            # Resize to exact section size (maintaining aspect ratio already in crop)
+            person_resized = cv2.resize(person_crop, (output_width, actual_section_height), interpolation=cv2.INTER_LINEAR)
+            output_frame[y_start:y_end, :] = person_resized
+    
+    elif aspect_ratio > 1.2:  # Horizontal (16:9 = 1.778, landscape)
+        # Stack horizontally (side by side)
+        section_width = output_width // num_people
+        
+        for i, person in enumerate(people_data):
+            person_box = person['face_box'] or person['person_box']
+            
+            # Calculate section bounds
+            x_start = i * section_width
+            x_end = x_start + section_width
+            if i == num_people - 1 and x_end < output_width:
+                x_end = output_width
+            actual_section_width = x_end - x_start
+            
+            # Each section maintains aspect ratio
+            section_aspect = actual_section_width / output_height
+            
+            # Crop person with the section's aspect ratio (not stretched)
+            crop_box = calculate_crop_box(person_box, frame_width, frame_height, section_aspect)
+            person_crop = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
+            
+            # Resize to exact section size (maintaining aspect ratio already in crop)
+            person_resized = cv2.resize(person_crop, (actual_section_width, output_height), interpolation=cv2.INTER_LINEAR)
+            output_frame[:, x_start:x_end] = person_resized
+    
+    else:  # Square-ish (1:1 = 1.0)
+        # For 2 people: side by side
+        # For 3-4 people: 2x2 grid
+        if num_people == 2:
+            # Side by side
+            section_width = output_width // 2
+            section_aspect = section_width / output_height
+            
+            for i, person in enumerate(people_data):
+                person_box = person['face_box'] or person['person_box']
+                
+                # Crop person with the section's aspect ratio (not stretched)
+                crop_box = calculate_crop_box(person_box, frame_width, frame_height, section_aspect)
+                person_crop = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
+                
+                # Resize to exact section size
+                person_resized = cv2.resize(person_crop, (section_width, output_height), interpolation=cv2.INTER_LINEAR)
+                
+                x_start = i * section_width
+                output_frame[:, x_start:x_start + section_width] = person_resized
+        
+        elif num_people == 3:
+            # Top: 2 people, Bottom: 1 person (centered)
+            section_height = output_height // 2
+            top_section_width = output_width // 2
+            top_section_aspect = top_section_width / section_height
+            bottom_section_aspect = output_width / section_height
+            
+            # Top row: 2 people
+            for i in range(2):
+                person = people_data[i]
+                person_box = person['face_box'] or person['person_box']
+                # Crop with correct aspect ratio for top sections
+                crop_box = calculate_crop_box(person_box, frame_width, frame_height, top_section_aspect)
+                person_crop = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
+                person_resized = cv2.resize(person_crop, (top_section_width, section_height), interpolation=cv2.INTER_LINEAR)
+                output_frame[0:section_height, i * top_section_width:(i + 1) * top_section_width] = person_resized
+            
+            # Bottom row: 1 person (full width)
+            person = people_data[2]
+            person_box = person['face_box'] or person['person_box']
+            # Crop with correct aspect ratio for bottom section
+            crop_box = calculate_crop_box(person_box, frame_width, frame_height, bottom_section_aspect)
+            person_crop = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
+            person_resized = cv2.resize(person_crop, (output_width, section_height), interpolation=cv2.INTER_LINEAR)
+            output_frame[section_height:, :] = person_resized
+        
+        else:  # 4 people: 2x2 grid
+            section_width = output_width // 2
+            section_height = output_height // 2
+            # Each grid cell is square (1:1)
+            section_aspect = section_width / section_height
+            
+            for i, person in enumerate(people_data):
+                person_box = person['face_box'] or person['person_box']
+                # Crop with correct aspect ratio for each grid cell
+                crop_box = calculate_crop_box(person_box, frame_width, frame_height, section_aspect)
+                person_crop = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
+                person_resized = cv2.resize(person_crop, (section_width, section_height), interpolation=cv2.INTER_LINEAR)
+                
+                row = i // 2
+                col = i % 2
+                y_start = row * section_height
+                x_start = col * section_width
+                output_frame[y_start:y_start + section_height, x_start:x_start + section_width] = person_resized
+    
+    return output_frame
 
 
 def get_video_resolution(video_path):
@@ -361,6 +512,10 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
                 crop_box = calculate_crop_box(target_box, original_width, original_height, aspect_ratio)
                 processed_frame = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
                 output_frame = cv2.resize(processed_frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT), interpolation=cv2.INTER_LINEAR)
+            elif strategy == 'STACK':
+                # Stack multiple people vertically
+                people_data = target_box  # target_box contains the list of people for STACK strategy
+                output_frame = create_stacked_frame(frame, people_data, OUTPUT_WIDTH, OUTPUT_HEIGHT, aspect_ratio)
             else:  # LETTERBOX
                 scale_factor = OUTPUT_WIDTH / original_width
                 scaled_height = int(original_height * scale_factor)
