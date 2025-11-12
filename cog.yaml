@@ -22,7 +22,7 @@ build:
   # commands run after the environment is setup
   # Pre-download all YOLO models during build to avoid setup timeouts
   run:
-    - "python -c 'from ultralytics import YOLO; print(\"Downloading YOLO models...\"); YOLO(\"yolov8x.pt\"); YOLO(\"yolov8m.pt\"); YOLO(\"yolov8s.pt\"); print(\"All models downloaded!\")'"
+    - 'python -c ''from ultralytics import YOLO; print("Downloading YOLO models..."); YOLO("yolov8x.pt"); YOLO("yolov8m.pt"); YOLO("yolov8s.pt"); print("All models downloaded!")'''
 
 # predict.py defines how predictions are run on your model
 predict: "predict.py:Predictor"
