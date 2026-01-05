@@ -483,15 +483,30 @@ def calculate_crop_box_centered(center_x, center_y, reference_box, frame_width, 
         frame_width: Frame width
         frame_height: Frame height
         aspect_ratio: Desired aspect ratio (width/height)
-        zoom_factor: How much to zoom in (1.0 = full height, higher = tighter)
+        zoom_factor: How much to zoom in (1.0 = full frame, higher = tighter crop around person)
     """
     ref_height = reference_box[3] - reference_box[1]
+    ref_width = reference_box[2] - reference_box[0]
     
     # Calculate crop dimensions based on zoom
+    # Higher zoom = smaller crop area (tighter on person)
     if zoom_factor > 1.0:
-        crop_height = ref_height * zoom_factor
+        # Crop should be sized so person fills a good portion of it
+        # zoom_factor of 2.0 means person should fill about 50% of crop
+        # zoom_factor of 3.0 means person should fill about 66% of crop
+        target_person_fill = 1.0 - (1.0 / zoom_factor)  # 2.0 -> 0.5, 3.0 -> 0.66, 4.0 -> 0.75
+        target_person_fill = max(0.4, min(target_person_fill, 0.8))  # Clamp to reasonable range
+        
+        # Calculate crop size based on person filling target percentage
+        crop_height = ref_height / target_person_fill
         crop_width = crop_height * aspect_ratio
+        
+        # If crop width is too narrow for person, adjust
+        if crop_width < ref_width / target_person_fill:
+            crop_width = ref_width / target_person_fill
+            crop_height = crop_width / aspect_ratio
     else:
+        # No zoom - use full frame height
         crop_height = frame_height
         crop_width = crop_height * aspect_ratio
     
@@ -502,6 +517,16 @@ def calculate_crop_box_centered(center_x, center_y, reference_box, frame_width, 
     if crop_height > frame_height:
         crop_height = frame_height
         crop_width = crop_height * aspect_ratio
+    
+    # Ensure minimum crop size (at least as big as the person)
+    min_crop_height = ref_height * 1.3  # At least 30% padding around person
+    min_crop_width = ref_width * 1.3
+    if crop_height < min_crop_height:
+        crop_height = min(min_crop_height, frame_height)
+        crop_width = crop_height * aspect_ratio
+    if crop_width < min_crop_width:
+        crop_width = min(min_crop_width, frame_width)
+        crop_height = crop_width / aspect_ratio
     
     # Center on specified point
     x1 = center_x - crop_width / 2
@@ -587,10 +612,10 @@ def resize_cover(image, target_width, target_height):
     return cropped
 
 
-def calculate_optimal_zoom(person_box, section_width, section_height, frame_width, frame_height, face_box=None):
+def calculate_optimal_zoom(person_box, section_width, section_height, frame_width, frame_height, face_box=None, is_stacking=False):
     """
-    Calculate optimal zoom factor to fit person in section without stretching.
-    Now uses more conservative zoom to avoid excessive face cropping.
+    Calculate optimal zoom factor to fit person in section.
+    Higher zoom = tighter crop around person.
     
     Args:
         person_box: Person bounding box [x1, y1, x2, y2]
@@ -599,47 +624,60 @@ def calculate_optimal_zoom(person_box, section_width, section_height, frame_widt
         frame_width: Original frame width
         frame_height: Original frame height
         face_box: Optional face bounding box for better framing
+        is_stacking: If True, use tighter zoom to isolate person in split-screen
         
     Returns:
-        Optimal zoom factor (1.0 = full frame, higher = tighter)
+        Optimal zoom factor (1.0 = full frame, higher = tighter crop)
     """
     person_width = person_box[2] - person_box[0]
     person_height = person_box[3] - person_box[1]
     
     if person_height <= 0 or person_width <= 0:
-        return 1.5
+        return 2.5 if is_stacking else 1.5
     
-    # Calculate how much of the section we want the person to fill
-    # Reduced from 0.7 to 0.5 for less aggressive zoom
-    target_fill = 0.5
-    
-    # Calculate section aspect ratio
-    section_aspect = section_width / section_height
-    
-    # Determine limiting dimension
-    person_aspect = person_width / person_height
-    
-    if person_aspect > section_aspect:
-        # Person is wide - width is limiting dimension
-        desired_crop_width = person_width / target_fill
-        desired_crop_height = desired_crop_width / section_aspect
-        zoom = desired_crop_height / person_height if person_height > 0 else 1.5
+    if is_stacking:
+        # For split-screen: we want a tight crop that isolates this person
+        # Person should fill about 50-60% of the crop area
+        target_fill = 0.55
+        
+        # The zoom determines how tight the crop is
+        # Higher zoom = person fills more of the crop = smaller crop area
+        
+        # Base zoom on person size relative to frame
+        # If person is small, we need higher zoom to isolate them
+        person_frame_ratio = person_height / frame_height
+        
+        # Smaller person = higher zoom needed
+        # Person at 50% of frame -> zoom ~2.0
+        # Person at 25% of frame -> zoom ~3.0
+        # Person at 10% of frame -> zoom ~4.0
+        zoom = target_fill / person_frame_ratio if person_frame_ratio > 0 else 3.0
+        
+        # Clamp zoom: minimum 2.0 to ensure isolation, max 4.0 to avoid extreme close-ups
+        zoom = max(2.0, min(zoom, 4.0))
+        
+        # If we have a face, check it won't be too large in final output
+        if face_box is not None:
+            face_height = face_box[3] - face_box[1]
+            if face_height > 0:
+                # Estimate how much of section the face will fill
+                # After crop and resize, face should be max ~30% of section
+                crop_height = person_height / target_fill  # Approximate crop height
+                face_in_crop_ratio = face_height / crop_height
+                # After resize to section, face ratio stays roughly the same
+                if face_in_crop_ratio > 0.35:
+                    # Face would be too big, reduce zoom
+                    adjustment = 0.35 / face_in_crop_ratio
+                    zoom = zoom * adjustment
+                    zoom = max(2.0, zoom)
     else:
-        # Person is tall - height is limiting dimension
-        desired_crop_height = person_height / target_fill
-        zoom = desired_crop_height / person_height if person_height > 0 else 1.5
-    
-    # If we have a face, ensure the zoom doesn't crop too tightly
-    if face_box is not None:
-        face_height = face_box[3] - face_box[1]
-        # Face should be at most 40% of section height
-        max_face_fill = 0.4
-        min_zoom_for_face = (face_height / max_face_fill) / section_height
-        # Ensure we don't zoom tighter than what the face allows
-        zoom = max(zoom, min_zoom_for_face * person_height / face_height if face_height > 0 else zoom)
-    
-    # Clamp zoom to more conservative range (was 1.3-2.5, now 1.2-2.0)
-    zoom = max(1.2, min(zoom, 2.0))
+        # Regular tracking mode - gentler zoom
+        target_fill = 0.5
+        person_frame_ratio = person_height / frame_height
+        zoom = target_fill / person_frame_ratio if person_frame_ratio > 0 else 1.5
+        
+        # Conservative range for tracking
+        zoom = max(1.2, min(zoom, 2.5))
     
     return zoom
 
@@ -724,9 +762,9 @@ def create_stacked_frame(frame, people_data, output_width, output_height, aspect
             actual_section_height = y_end - y_start
             actual_section_aspect = output_width / actual_section_height
             
-            # Calculate optimal zoom using person_box (not face_box) for better framing
+            # Calculate optimal zoom with is_stacking=True for tighter isolation
             zoom = calculate_optimal_zoom(person_box, output_width, actual_section_height, 
-                                         frame_width, frame_height, face_box=face_box)
+                                         frame_width, frame_height, face_box=face_box, is_stacking=True)
             
             # Get smart center point that considers face position
             center_x, center_y = get_smart_center_point(person_box, face_box)
@@ -761,9 +799,9 @@ def create_stacked_frame(frame, people_data, output_width, output_height, aspect
             # Each section maintains aspect ratio
             section_aspect = actual_section_width / output_height
             
-            # Calculate optimal zoom
+            # Calculate optimal zoom with is_stacking=True
             zoom = calculate_optimal_zoom(person_box, actual_section_width, output_height, 
-                                         frame_width, frame_height, face_box=face_box)
+                                         frame_width, frame_height, face_box=face_box, is_stacking=True)
             
             # Get smart center point
             center_x, center_y = get_smart_center_point(person_box, face_box)
@@ -789,9 +827,9 @@ def create_stacked_frame(frame, people_data, output_width, output_height, aspect
             person_box = person['person_box']
             face_box = person.get('face_box')
             
-            # Calculate optimal zoom
+            # Calculate optimal zoom with is_stacking=True
             zoom = calculate_optimal_zoom(person_box, section_width, output_height, 
-                                         frame_width, frame_height, face_box=face_box)
+                                         frame_width, frame_height, face_box=face_box, is_stacking=True)
             
             # Get smart center point
             center_x, center_y = get_smart_center_point(person_box, face_box)
