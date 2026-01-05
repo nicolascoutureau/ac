@@ -9,13 +9,102 @@ import numpy as np
 from tqdm import tqdm
 import threading
 import queue
+import urllib.request
 
-def analyze_scene_content(video_path, scene_start_time, scene_end_time, model, face_cascade, analysis_scale=1.0, dnn_face_detector=None, confidence_threshold=0.5):
+
+def load_dnn_face_detector():
+    """
+    Load OpenCV DNN face detector with Caffe model.
+    Downloads model files if not present.
+    
+    Returns:
+        cv2.dnn.Net or None if loading fails
+    """
+    # Model files
+    prototxt_path = os.path.join(os.path.dirname(__file__), "deploy.prototxt")
+    model_path = os.path.join(os.path.dirname(__file__), "res10_300x300_ssd_iter_140000.caffemodel")
+    
+    # URLs for model files
+    prototxt_url = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
+    model_url = "https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
+    
+    try:
+        # Download prototxt if missing
+        if not os.path.exists(prototxt_path):
+            print("📥 Downloading DNN face detector prototxt...")
+            urllib.request.urlretrieve(prototxt_url, prototxt_path)
+        
+        # Download model if missing
+        if not os.path.exists(model_path):
+            print("📥 Downloading DNN face detector model (~10MB)...")
+            urllib.request.urlretrieve(model_url, model_path)
+        
+        # Load the network
+        net = cv2.dnn.readNetFromCaffe(prototxt_path, model_path)
+        print("✅ DNN face detector loaded (provides confidence scores)")
+        return net
+    except Exception as e:
+        print(f"⚠️  Could not load DNN face detector: {e}")
+        print("   Falling back to Haar Cascade (no confidence scores)")
+        return None
+
+def detect_face_dnn(frame, face_net, person_box=None, min_confidence=0.5):
+    """
+    Detect faces using OpenCV DNN face detector with confidence scores.
+    
+    Args:
+        frame: Input frame (BGR)
+        face_net: OpenCV DNN face detection network
+        person_box: Optional [x1, y1, x2, y2] to restrict search area
+        min_confidence: Minimum confidence threshold for face detection
+        
+    Returns:
+        List of (face_box, confidence) tuples
+    """
+    if person_box:
+        x1, y1, x2, y2 = person_box
+        roi = frame[y1:y2, x1:x2]
+        offset_x, offset_y = x1, y1
+    else:
+        roi = frame
+        offset_x, offset_y = 0, 0
+    
+    h, w = roi.shape[:2]
+    if h == 0 or w == 0:
+        return []
+    
+    # Create blob for DNN
+    blob = cv2.dnn.blobFromImage(roi, 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=False, crop=False)
+    face_net.setInput(blob)
+    detections = face_net.forward()
+    
+    faces = []
+    for i in range(detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
+        if confidence > min_confidence:
+            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+            fx1, fy1, fx2, fy2 = box.astype(int)
+            
+            # Offset back to full frame coordinates
+            face_box = [
+                max(0, fx1 + offset_x),
+                max(0, fy1 + offset_y),
+                fx2 + offset_x,
+                fy2 + offset_y
+            ]
+            faces.append((face_box, float(confidence)))
+    
+    return faces
+
+
+def analyze_scene_content(video_path, scene_start_time, scene_end_time, model, face_cascade, analysis_scale=1.0, dnn_face_detector=None, confidence_threshold=0.3):
     """
     Analyzes the middle frame of a scene to detect people and faces.
     
     Args:
-        confidence_threshold: Minimum confidence (0-1) for YOLO person detection. Default: 0.5
+        confidence_threshold: Minimum confidence (0-1) for YOLO person detection. Default: 0.3 (lowered for better recall)
+        dnn_face_detector: Optional OpenCV DNN face detector for confidence scores
+        
     Uses fallback detection if primary method doesn't find anything.
     
     Args:
@@ -76,45 +165,90 @@ def analyze_scene_content(video_path, scene_start_time, scene_end_time, model, f
                 x2 = int(x2 * scale_back_x)
                 y2 = int(y2 * scale_back_y)
                 
+                # Clamp to frame bounds
+                x1 = max(0, x1)
+                y1 = max(0, y1)
+                x2 = min(frame_width, x2)
+                y2 = min(frame_height, y2)
+                
                 person_box = [x1, y1, x2, y2]
                 
-                # Detect face within person box on original resolution frame
-                person_roi_gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
-                faces = face_cascade.detectMultiScale(person_roi_gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-                
+                # Detect face within person box
                 face_box = None
-                if len(faces) > 0:
-                    fx, fy, fw, fh = faces[0]
-                    face_box = [x1 + fx, y1 + fy, x1 + fx + fw, y1 + fy + fh]
+                face_confidence = 0.0
+                
+                if dnn_face_detector is not None:
+                    # Use DNN face detector with confidence
+                    faces = detect_face_dnn(frame, dnn_face_detector, person_box, min_confidence=0.5)
+                    if faces:
+                        # Take the face with highest confidence
+                        faces.sort(key=lambda x: x[1], reverse=True)
+                        face_box, face_confidence = faces[0]
+                else:
+                    # Fallback to Haar Cascade (no confidence)
+                    person_roi_gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+                    faces = face_cascade.detectMultiScale(person_roi_gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+                    
+                    if len(faces) > 0:
+                        fx, fy, fw, fh = faces[0]
+                        face_box = [x1 + fx, y1 + fy, x1 + fx + fw, y1 + fy + fh]
+                        face_confidence = 0.8  # Assumed confidence for Haar
 
                 detected_objects.append({
                     'person_box': person_box, 
                     'face_box': face_box,
-                    'confidence': confidence
+                    'confidence': confidence,
+                    'face_confidence': face_confidence
                 })
     
-    # Fallback detection: Use Haar Cascade on full frame if YOLO found no people
+    # Fallback detection: Use face detector on full frame if YOLO found no people
     if len(detected_objects) == 0:
-        print("  ⚠️  YOLO detected no people, trying Haar Cascade fallback...")
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
+        print("  ⚠️  YOLO detected no people, trying face detection fallback...")
         
-        for (x, y, w, h) in faces:
-            face_box = [x, y, x + w, y + h]
-            # Create a person box slightly larger than face box
-            padding = int(max(w, h) * 0.5)
-            person_box = [
-                max(0, x - padding),
-                max(0, y - padding),
-                min(frame_width, x + w + padding),
-                min(frame_height, y + h + padding)
-            ]
-            detected_objects.append({
-                'person_box': person_box, 
-                'face_box': face_box,
-                'confidence': 0.3  # Lower confidence for fallback detection
-            })
-            break  # Just use the first face found
+        if dnn_face_detector is not None:
+            # Use DNN face detector with confidence
+            faces = detect_face_dnn(frame, dnn_face_detector, min_confidence=0.4)
+            for face_box, face_conf in faces:
+                fx1, fy1, fx2, fy2 = face_box
+                fw, fh = fx2 - fx1, fy2 - fy1
+                # Create person box: extend face box to estimate body
+                # Head is typically 1/7 to 1/8 of body height
+                estimated_body_height = fh * 5
+                padding_x = int(fw * 0.8)
+                person_box = [
+                    max(0, fx1 - padding_x),
+                    max(0, fy1 - int(fh * 0.3)),  # Small padding above head
+                    min(frame_width, fx2 + padding_x),
+                    min(frame_height, fy1 + estimated_body_height)
+                ]
+                detected_objects.append({
+                    'person_box': person_box, 
+                    'face_box': face_box,
+                    'confidence': face_conf * 0.7,  # Slightly lower since no body detection
+                    'face_confidence': face_conf
+                })
+        else:
+            # Haar cascade fallback
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
+            
+            for (x, y, w, h) in faces:
+                face_box = [x, y, x + w, y + h]
+                # Create person box: extend face box to estimate body
+                estimated_body_height = h * 5
+                padding_x = int(w * 0.8)
+                person_box = [
+                    max(0, x - padding_x),
+                    max(0, y - int(h * 0.3)),
+                    min(frame_width, x + w + padding_x),
+                    min(frame_height, y + estimated_body_height)
+                ]
+                detected_objects.append({
+                    'person_box': person_box, 
+                    'face_box': face_box,
+                    'confidence': 0.4,  # Lower confidence for fallback detection
+                    'face_confidence': 0.7  # Assumed for Haar
+                })
     
     cap.release()
     return detected_objects
@@ -143,16 +277,17 @@ def get_enclosing_box(boxes):
     return [min_x, min_y, max_x, max_y]
 
 
-def would_require_excessive_zoom(target_box, frame_width, frame_height, aspect_ratio, max_zoom=3.0):
+def would_require_excessive_zoom(target_box, frame_width, frame_height, aspect_ratio, max_zoom=4.0):
     """
     Check if tracking this target would require excessive zoom.
+    Now uses a more lenient calculation based on target size relative to frame.
     
     Args:
         target_box: Bounding box [x1, y1, x2, y2]
         frame_width: Frame width
         frame_height: Frame height
         aspect_ratio: Target aspect ratio
-        max_zoom: Maximum acceptable zoom factor
+        max_zoom: Maximum acceptable zoom factor (default increased to 4.0)
         
     Returns:
         True if zoom would exceed max_zoom
@@ -160,90 +295,113 @@ def would_require_excessive_zoom(target_box, frame_width, frame_height, aspect_r
     target_height = target_box[3] - target_box[1]
     target_width = target_box[2] - target_box[0]
     
-    # Calculate what crop dimensions would be needed
-    output_width = int(frame_height * aspect_ratio)
-    output_height = frame_height
+    if target_height <= 0 or target_width <= 0:
+        return True
     
-    # Calculate zoom needed (similar logic to calculate_optimal_zoom)
-    target_fill = 0.7
-    section_aspect = output_width / output_height
-    target_aspect = target_width / target_height
+    # Calculate crop dimensions at full frame height
+    crop_width = frame_height * aspect_ratio
+    crop_height = frame_height
     
-    if target_aspect > section_aspect:
-        desired_crop_width = target_width / target_fill
-        desired_crop_height = desired_crop_width / section_aspect
-        required_zoom = desired_crop_height / target_height
-    else:
-        desired_crop_height = target_height / target_fill
-        required_zoom = desired_crop_height / target_height
+    # If crop fits within frame, we can track without zoom
+    if crop_width <= frame_width:
+        # Check if target is reasonably sized (at least 10% of crop area)
+        target_area = target_width * target_height
+        crop_area = crop_width * crop_height
+        
+        # Very small targets would need excessive zoom
+        min_area_ratio = 0.02  # Target should be at least 2% of crop area
+        if target_area / crop_area < min_area_ratio:
+            return True
+        
+        # Also check height ratio - target should be at least 15% of frame height
+        if target_height / frame_height < 0.15:
+            return True
+        
+        return False
     
-    return required_zoom > max_zoom
+    # Crop doesn't fit - would need to scale down, not zoom
+    return False
 
 
-def decide_cropping_strategy(scene_analysis, frame_height, frame_width, aspect_ratio, max_zoom=3.0):
+def decide_cropping_strategy(scene_analysis, frame_height, frame_width, aspect_ratio, max_zoom=4.0):
     """
     Decide the cropping strategy based on scene content.
-    Falls back to LETTERBOX if tracking would require excessive zoom.
+    Falls back to LETTERBOX only when tracking is truly not viable.
     
     Args:
-        max_zoom: Maximum acceptable zoom factor before falling back to letterbox (default: 3.0)
+        max_zoom: Maximum acceptable zoom factor before falling back to letterbox (default: 4.0)
     """
     num_people = len(scene_analysis)
     if num_people == 0:
         return 'LETTERBOX', None
     
     if num_people == 1:
-        target_box = scene_analysis[0]['face_box'] or scene_analysis[0]['person_box']
+        person = scene_analysis[0]
+        # Use person_box for tracking (better framing), face_box only influences centering
+        target_box = person['person_box']
         
         # Check if zoom would be excessive for single person
         if would_require_excessive_zoom(target_box, frame_width, frame_height, aspect_ratio, max_zoom):
-            print(f"  ⚠️  Person too small (zoom > {max_zoom}x), using LETTERBOX")
+            print(f"  ⚠️  Person too small, using LETTERBOX")
             return 'LETTERBOX', None
         
         return 'TRACK', target_box
     
-    # Multiple people detected
-    person_boxes = [obj['person_box'] for obj in scene_analysis]
+    # Multiple people detected - sort by confidence and take top detections
+    sorted_by_confidence = sorted(scene_analysis, key=lambda x: x['confidence'], reverse=True)
+    
+    # For 2-3 people, try to include them all
+    people_to_track = sorted_by_confidence[:min(3, num_people)]
+    
+    person_boxes = [obj['person_box'] for obj in people_to_track]
     group_box = get_enclosing_box(person_boxes)
     group_width = group_box[2] - group_box[0]
     max_width_for_crop = frame_height * aspect_ratio
     
     # If people fit horizontally, track the group
-    if group_width < max_width_for_crop:
-        # Check if zoom would be excessive for group
-        if would_require_excessive_zoom(group_box, frame_width, frame_height, aspect_ratio, max_zoom):
-            print(f"  ⚠️  Group too small (zoom > {max_zoom}x), using LETTERBOX")
-            return 'LETTERBOX', None
-        
-        return 'TRACK', group_box
+    if group_width < max_width_for_crop * 1.2:  # Allow 20% overflow (will be handled by crop)
+        # Check if group is reasonably sized
+        if not would_require_excessive_zoom(group_box, frame_width, frame_height, aspect_ratio, max_zoom):
+            return 'TRACK', group_box
     
-    # If exactly 2 people are too far apart, check if stacking would need excessive zoom
+    # If exactly 2 people are too far apart for single crop, use stacking
     if num_people == 2:
-        # Check if individual people are too small for stacking
-        # For stacking, each person gets half the output space
-        output_width = int(frame_height * aspect_ratio)
-        output_height = frame_height
-        
-        # Check zoom needed for each person in their section
-        section_height = output_height // 2 if aspect_ratio < 0.8 else output_height
-        section_width = output_width // 2 if aspect_ratio > 1.2 else output_width
-        
+        # Check if people are reasonably sized for stacking
+        can_stack = True
         for person in scene_analysis:
-            person_box = person['face_box'] or person['person_box']
+            person_box = person['person_box']
             person_height = person_box[3] - person_box[1]
             person_width = person_box[2] - person_box[0]
             
-            # Rough estimate: if person is less than 1/6 of frame, they'll need >3x zoom
-            if person_height < frame_height / 6 or person_width < frame_width / 6:
-                print(f"  ⚠️  People too small for stacking (zoom > {max_zoom}x), using LETTERBOX")
-                return 'LETTERBOX', None
+            # More lenient check: person should be at least 8% of frame area
+            person_area = person_height * person_width
+            frame_area = frame_height * frame_width
+            if person_area / frame_area < 0.02:  # 2% minimum
+                can_stack = False
+                break
         
-        # Sort people by horizontal position (left to right)
-        sorted_people = sorted(scene_analysis, key=lambda x: x['person_box'][0])
-        return 'STACK', sorted_people
+        if can_stack:
+            # Sort people by horizontal position (left to right) for consistent stacking
+            sorted_people = sorted(scene_analysis, key=lambda x: x['person_box'][0])
+            return 'STACK', sorted_people
     
-    # Too many people or they can't be stacked nicely, use letterbox
-    return 'LETTERBOX', None
+    # For 3+ people spread apart, try tracking the two most confident
+    if num_people >= 3:
+        top_two = sorted_by_confidence[:2]
+        two_person_boxes = [obj['person_box'] for obj in top_two]
+        two_group_box = get_enclosing_box(two_person_boxes)
+        two_group_width = two_group_box[2] - two_group_box[0]
+        
+        if two_group_width < max_width_for_crop:
+            return 'TRACK', two_group_box
+        
+        # Try stacking the top 2
+        sorted_two = sorted(top_two, key=lambda x: x['person_box'][0])
+        return 'STACK', sorted_two
+    
+    # Last resort: track the most confident person
+    best_person = sorted_by_confidence[0]
+    return 'TRACK', best_person['person_box']
 
 
 def calculate_crop_box(target_box, frame_width, frame_height, aspect_ratio, zoom_factor=1.0):
@@ -314,6 +472,71 @@ def calculate_crop_box(target_box, frame_width, frame_height, aspect_ratio, zoom
     return [int(x1), int(y1), int(x2), int(y2)]
 
 
+def calculate_crop_box_centered(center_x, center_y, reference_box, frame_width, frame_height, aspect_ratio, zoom_factor=1.0):
+    """
+    Calculate crop box centered on a specific point with reference to a bounding box.
+    Used for smarter centering in split-screen mode.
+    
+    Args:
+        center_x, center_y: Center point for the crop
+        reference_box: Reference bounding box [x1, y1, x2, y2] to calculate dimensions
+        frame_width: Frame width
+        frame_height: Frame height
+        aspect_ratio: Desired aspect ratio (width/height)
+        zoom_factor: How much to zoom in (1.0 = full height, higher = tighter)
+    """
+    ref_height = reference_box[3] - reference_box[1]
+    
+    # Calculate crop dimensions based on zoom
+    if zoom_factor > 1.0:
+        crop_height = ref_height * zoom_factor
+        crop_width = crop_height * aspect_ratio
+    else:
+        crop_height = frame_height
+        crop_width = crop_height * aspect_ratio
+    
+    # Constrain crop to fit within frame while maintaining aspect ratio
+    if crop_width > frame_width:
+        crop_width = frame_width
+        crop_height = crop_width / aspect_ratio
+    if crop_height > frame_height:
+        crop_height = frame_height
+        crop_width = crop_height * aspect_ratio
+    
+    # Center on specified point
+    x1 = center_x - crop_width / 2
+    y1 = center_y - crop_height / 2
+    x2 = x1 + crop_width
+    y2 = y1 + crop_height
+    
+    # Shift to keep within bounds (maintaining size)
+    if x1 < 0:
+        shift = -x1
+        x1 += shift
+        x2 += shift
+    elif x2 > frame_width:
+        shift = x2 - frame_width
+        x1 -= shift
+        x2 -= shift
+    
+    if y1 < 0:
+        shift = -y1
+        y1 += shift
+        y2 += shift
+    elif y2 > frame_height:
+        shift = y2 - frame_height
+        y1 -= shift
+        y2 -= shift
+    
+    # Final clamp
+    x1 = max(0, min(x1, frame_width - crop_width))
+    y1 = max(0, min(y1, frame_height - crop_height))
+    x2 = x1 + crop_width
+    y2 = y1 + crop_height
+    
+    return [int(x1), int(y1), int(x2), int(y2)]
+
+
 def resize_cover(image, target_width, target_height):
     """
     Resize image to cover target dimensions (like CSS object-fit: cover).
@@ -364,9 +587,10 @@ def resize_cover(image, target_width, target_height):
     return cropped
 
 
-def calculate_optimal_zoom(person_box, section_width, section_height, frame_width, frame_height):
+def calculate_optimal_zoom(person_box, section_width, section_height, frame_width, frame_height, face_box=None):
     """
     Calculate optimal zoom factor to fit person in section without stretching.
+    Now uses more conservative zoom to avoid excessive face cropping.
     
     Args:
         person_box: Person bounding box [x1, y1, x2, y2]
@@ -374,6 +598,7 @@ def calculate_optimal_zoom(person_box, section_width, section_height, frame_widt
         section_height: Target section height
         frame_width: Original frame width
         frame_height: Original frame height
+        face_box: Optional face bounding box for better framing
         
     Returns:
         Optimal zoom factor (1.0 = full frame, higher = tighter)
@@ -381,37 +606,91 @@ def calculate_optimal_zoom(person_box, section_width, section_height, frame_widt
     person_width = person_box[2] - person_box[0]
     person_height = person_box[3] - person_box[1]
     
-    # Calculate how much of the section we want the person to fill (60-80%)
-    target_fill = 0.7
+    if person_height <= 0 or person_width <= 0:
+        return 1.5
+    
+    # Calculate how much of the section we want the person to fill
+    # Reduced from 0.7 to 0.5 for less aggressive zoom
+    target_fill = 0.5
     
     # Calculate section aspect ratio
     section_aspect = section_width / section_height
     
     # Determine limiting dimension
-    # If person is wider relative to section aspect, width is limiting
     person_aspect = person_width / person_height
     
     if person_aspect > section_aspect:
         # Person is wide - width is limiting dimension
-        # Calculate zoom based on how much of section width person should fill
         desired_crop_width = person_width / target_fill
         desired_crop_height = desired_crop_width / section_aspect
-        zoom = desired_crop_height / person_height
+        zoom = desired_crop_height / person_height if person_height > 0 else 1.5
     else:
         # Person is tall - height is limiting dimension
-        # Calculate zoom based on how much of section height person should fill
         desired_crop_height = person_height / target_fill
-        zoom = desired_crop_height / person_height
+        zoom = desired_crop_height / person_height if person_height > 0 else 1.5
     
-    # Clamp zoom to reasonable range
-    zoom = max(1.3, min(zoom, 2.5))  # Between 1.3x and 2.5x
+    # If we have a face, ensure the zoom doesn't crop too tightly
+    if face_box is not None:
+        face_height = face_box[3] - face_box[1]
+        # Face should be at most 40% of section height
+        max_face_fill = 0.4
+        min_zoom_for_face = (face_height / max_face_fill) / section_height
+        # Ensure we don't zoom tighter than what the face allows
+        zoom = max(zoom, min_zoom_for_face * person_height / face_height if face_height > 0 else zoom)
+    
+    # Clamp zoom to more conservative range (was 1.3-2.5, now 1.2-2.0)
+    zoom = max(1.2, min(zoom, 2.0))
     
     return zoom
+
+
+def get_smart_center_point(person_box, face_box=None):
+    """
+    Calculate a smart center point for cropping.
+    Uses face position to bias towards upper body while keeping person in frame.
+    
+    Args:
+        person_box: Person bounding box [x1, y1, x2, y2]
+        face_box: Optional face bounding box [x1, y1, x2, y2]
+        
+    Returns:
+        (center_x, center_y) tuple
+    """
+    person_center_x = (person_box[0] + person_box[2]) / 2
+    person_center_y = (person_box[1] + person_box[3]) / 2
+    
+    if face_box is not None:
+        face_center_x = (face_box[0] + face_box[2]) / 2
+        face_center_y = (face_box[1] + face_box[3]) / 2
+        
+        # Blend between person center and a point above face center
+        # This keeps the face in upper third while showing more body
+        # Horizontal: use face center for better face positioning
+        # Vertical: bias towards showing head + upper body
+        center_x = face_center_x
+        
+        # Place center below face to show upper body
+        # Face should be in upper 30-40% of the crop
+        face_height = face_box[3] - face_box[1]
+        center_y = face_center_y + face_height * 1.5  # Shift down to show more body
+        
+        # But don't go beyond person center (would cut off head)
+        center_y = min(center_y, person_center_y)
+        
+        return (center_x, center_y)
+    
+    # No face detected - use upper portion of person box
+    # Assume head is at top, so shift center up slightly
+    person_height = person_box[3] - person_box[1]
+    center_y = person_box[1] + person_height * 0.35  # Upper third
+    
+    return (person_center_x, center_y)
 
 
 def create_stacked_frame(frame, people_data, output_width, output_height, aspect_ratio):
     """
     Create a frame with 2 people stacked based on aspect ratio.
+    Improved centering and zoom to avoid excessive face cropping.
     
     Args:
         frame: Original video frame
@@ -434,7 +713,8 @@ def create_stacked_frame(frame, people_data, output_width, output_height, aspect
         section_height = output_height // 2
         
         for i, person in enumerate(people_data):
-            person_box = person['face_box'] or person['person_box']
+            person_box = person['person_box']
+            face_box = person.get('face_box')
             
             # Calculate section bounds
             y_start = i * section_height
@@ -444,23 +724,32 @@ def create_stacked_frame(frame, people_data, output_width, output_height, aspect
             actual_section_height = y_end - y_start
             actual_section_aspect = output_width / actual_section_height
             
-            # Calculate optimal zoom for this person and section
-            zoom = calculate_optimal_zoom(person_box, output_width, actual_section_height, frame_width, frame_height)
+            # Calculate optimal zoom using person_box (not face_box) for better framing
+            zoom = calculate_optimal_zoom(person_box, output_width, actual_section_height, 
+                                         frame_width, frame_height, face_box=face_box)
             
-            # Crop person with dynamic zoom
-            crop_box = calculate_crop_box(person_box, frame_width, frame_height, actual_section_aspect, zoom_factor=zoom)
+            # Get smart center point that considers face position
+            center_x, center_y = get_smart_center_point(person_box, face_box)
+            
+            # Calculate crop box centered on smart point
+            crop_box = calculate_crop_box_centered(
+                center_x, center_y, person_box,
+                frame_width, frame_height, actual_section_aspect, zoom_factor=zoom
+            )
             person_crop = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
             
             # Resize using "cover" method (no stretching)
-            person_resized = resize_cover(person_crop, output_width, actual_section_height)
-            output_frame[y_start:y_end, :] = person_resized
+            if person_crop.size > 0:
+                person_resized = resize_cover(person_crop, output_width, actual_section_height)
+                output_frame[y_start:y_end, :] = person_resized
     
     elif aspect_ratio > 1.2:  # Horizontal (16:9 = 1.778, landscape)
         # Stack horizontally (side by side)
         section_width = output_width // 2
         
         for i, person in enumerate(people_data):
-            person_box = person['face_box'] or person['person_box']
+            person_box = person['person_box']
+            face_box = person.get('face_box')
             
             # Calculate section bounds
             x_start = i * section_width
@@ -472,16 +761,24 @@ def create_stacked_frame(frame, people_data, output_width, output_height, aspect
             # Each section maintains aspect ratio
             section_aspect = actual_section_width / output_height
             
-            # Calculate optimal zoom for this person and section
-            zoom = calculate_optimal_zoom(person_box, actual_section_width, output_height, frame_width, frame_height)
+            # Calculate optimal zoom
+            zoom = calculate_optimal_zoom(person_box, actual_section_width, output_height, 
+                                         frame_width, frame_height, face_box=face_box)
             
-            # Crop person with dynamic zoom
-            crop_box = calculate_crop_box(person_box, frame_width, frame_height, section_aspect, zoom_factor=zoom)
+            # Get smart center point
+            center_x, center_y = get_smart_center_point(person_box, face_box)
+            
+            # Calculate crop box centered on smart point
+            crop_box = calculate_crop_box_centered(
+                center_x, center_y, person_box,
+                frame_width, frame_height, section_aspect, zoom_factor=zoom
+            )
             person_crop = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
             
             # Resize using "cover" method (no stretching)
-            person_resized = resize_cover(person_crop, actual_section_width, output_height)
-            output_frame[:, x_start:x_end] = person_resized
+            if person_crop.size > 0:
+                person_resized = resize_cover(person_crop, actual_section_width, output_height)
+                output_frame[:, x_start:x_end] = person_resized
     
     else:  # Square-ish (1:1 = 1.0)
         # Side by side for 2 people
@@ -489,20 +786,28 @@ def create_stacked_frame(frame, people_data, output_width, output_height, aspect
         section_aspect = section_width / output_height
         
         for i, person in enumerate(people_data):
-            person_box = person['face_box'] or person['person_box']
+            person_box = person['person_box']
+            face_box = person.get('face_box')
             
-            # Calculate optimal zoom for this person and section
-            zoom = calculate_optimal_zoom(person_box, section_width, output_height, frame_width, frame_height)
+            # Calculate optimal zoom
+            zoom = calculate_optimal_zoom(person_box, section_width, output_height, 
+                                         frame_width, frame_height, face_box=face_box)
             
-            # Crop person with dynamic zoom
-            crop_box = calculate_crop_box(person_box, frame_width, frame_height, section_aspect, zoom_factor=zoom)
+            # Get smart center point
+            center_x, center_y = get_smart_center_point(person_box, face_box)
+            
+            # Calculate crop box centered on smart point
+            crop_box = calculate_crop_box_centered(
+                center_x, center_y, person_box,
+                frame_width, frame_height, section_aspect, zoom_factor=zoom
+            )
             person_crop = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
             
             # Resize using "cover" method (no stretching)
-            person_resized = resize_cover(person_crop, section_width, output_height)
-            
-            x_start = i * section_width
-            output_frame[:, x_start:x_start + section_width] = person_resized
+            if person_crop.size > 0:
+                person_resized = resize_cover(person_crop, section_width, output_height)
+                x_start = i * section_width
+                output_frame[:, x_start:x_start + section_width] = person_resized
     
     return output_frame
 
@@ -531,23 +836,27 @@ def get_video_codec(video_path):
         return None
 
 
-def process_video(input_video, final_output_video, model, face_cascade, aspect_ratio=9/16, analysis_scale=1.0, use_gpu=False, confidence_threshold=0.5):
+def process_video(input_video, final_output_video, model, face_cascade, aspect_ratio=9/16, analysis_scale=1.0, use_gpu=False, confidence_threshold=0.3, use_dnn_face=True):
     """
     Main video processing function that converts horizontal video to vertical format.
-    
-    Args:
-        confidence_threshold: Minimum confidence (0-1) for person detection. Default: 0.5
     
     Args:
         input_video: Path to the input video file
         final_output_video: Path to the output video file
         model: YOLO model instance
-        face_cascade: Haar Cascade face detector instance
+        face_cascade: Haar Cascade face detector instance (fallback)
         aspect_ratio: Target aspect ratio (width/height), default is 9/16 for vertical video
         analysis_scale: Scale factor for scene analysis (e.g., 0.5 = half resolution for faster processing)
         use_gpu: Whether GPU is available for hardware acceleration
+        confidence_threshold: Minimum confidence (0-1) for person detection. Default: 0.3 (lowered for better recall)
+        use_dnn_face: Whether to use DNN face detector for confidence scores. Default: True
     """
     script_start_time = time.time()
+    
+    # Load DNN face detector if requested
+    dnn_face_detector = None
+    if use_dnn_face:
+        dnn_face_detector = load_dnn_face_detector()
     
     # Define temporary file paths based on the output name
     base_name = os.path.splitext(final_output_video)[0]
@@ -586,7 +895,8 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
 
     scenes_analysis = []
     for i, (start_time, end_time) in enumerate(tqdm(scenes, desc="Analyzing Scenes")):
-        analysis = analyze_scene_content(input_video, start_time, end_time, model, face_cascade, analysis_scale, confidence_threshold=confidence_threshold)
+        analysis = analyze_scene_content(input_video, start_time, end_time, model, face_cascade, analysis_scale, 
+                                        dnn_face_detector=dnn_face_detector, confidence_threshold=confidence_threshold)
         strategy, target_box = decide_cropping_strategy(analysis, original_height, original_width, aspect_ratio)
         scenes_analysis.append({
             'start_frame': start_time.get_frames(),
@@ -607,10 +917,16 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
         
         # Calculate average confidence for this scene
         if num_people > 0:
-            avg_confidence = sum(obj['confidence'] for obj in scene_data['analysis']) / num_people
-            print(f"  - Scene {i+1} ({start_time} -> {end_time}): Found {num_people} person(s) (avg conf: {avg_confidence:.2f}). Strategy: {strategy}")
+            avg_person_conf = sum(obj['confidence'] for obj in scene_data['analysis']) / num_people
+            face_confs = [obj.get('face_confidence', 0) for obj in scene_data['analysis'] if obj.get('face_confidence', 0) > 0]
+            if face_confs:
+                avg_face_conf = sum(face_confs) / len(face_confs)
+                faces_detected = len(face_confs)
+                print(f"  - Scene {i+1} ({start_time} -> {end_time}): {num_people} person(s) [conf: {avg_person_conf:.2f}], {faces_detected} face(s) [conf: {avg_face_conf:.2f}]. Strategy: {strategy}")
+            else:
+                print(f"  - Scene {i+1} ({start_time} -> {end_time}): {num_people} person(s) [conf: {avg_person_conf:.2f}], 0 faces. Strategy: {strategy}")
         else:
-            print(f"  - Scene {i+1} ({start_time} -> {end_time}): Found {num_people} person(s). Strategy: {strategy}")
+            print(f"  - Scene {i+1} ({start_time} -> {end_time}): 0 person(s). Strategy: {strategy}")
 
     print("\n✂️ Step 4: Processing video frames...")
     step_start_time = time.time()
