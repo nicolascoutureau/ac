@@ -315,6 +315,56 @@ force_strategy="stack"  # Future feature
 3. **No Overlays**: People are stacked, not overlaid (no picture-in-picture)
 4. **Static Order**: Order based on horizontal position (can't customize)
 
+## Active Speaker Detection
+
+When multiple people are detected, the system tries to identify **who is speaking** to focus on them instead of using split-screen.
+
+### TalkNet Local (Included)
+
+We use [TalkNet-ASD](https://github.com/TaoRuijie/TalkNet-ASD) locally - an audio-visual model that correlates lip movement with audio.
+
+**Setup:** Included by default! Model is downloaded during deploy.
+
+**For local development:**
+
+```bash
+# Install dependency
+pip install python_speech_features
+
+# Download model (~25MB)
+mkdir -p talknet_asd
+curl -L -o talknet_asd/pretrain_TalkSet.model \
+  "https://www.modelscope.cn/models/iic/cv_talknet_speaker-diarization/resolve/master/pretrain_TalkSet.model"
+```
+
+**Benefits:**
+
+- ✅ Uses both audio AND visual cues
+- ✅ Won't mistake nodding/expressions for speaking
+- ✅ Only detects speaking when audio matches lip movement
+- ✅ Runs locally - no API costs or latency
+- ✅ Works offline
+- ✅ Fast - uses GPU if available
+- ✅ Pre-downloaded on deploy - no runtime delay
+
+### Fallback Detection
+
+If TalkNet is not available, the system uses a **conservative** lip-movement-based detection:
+
+1. **Audio correlation**: Only counts lip movement during audio activity
+2. **High threshold**: Requires 2.5x more movement than others to declare a speaker
+3. **Defaults to split-screen**: When uncertain, shows both people instead of guessing wrong
+
+**Key improvement**: The system no longer assumes a single detected face is the speaker. It requires actual evidence of speaking (audio + lip correlation).
+
+### When Speaker Detection Helps
+
+| Scenario             | Without Speaker Detection  | With Speaker Detection      |
+| -------------------- | -------------------------- | --------------------------- |
+| Interview            | Split-screen (both people) | Focus on current speaker    |
+| Podcast              | Split-screen               | Focus on who's talking      |
+| One person listening | May show non-speaker       | Correctly identifies talker |
+
 ## Future Enhancements
 
 Possible improvements:
@@ -323,7 +373,7 @@ Possible improvements:
 - [ ] Side-by-side option for 16:9 output
 - [ ] Animated transitions between people
 - [ ] Picture-in-picture mode
-- [ ] Smart reordering based on who's speaking
+- [x] ~~Smart reordering based on who's speaking~~ ✅ Added with TalkNet!
 - [ ] Optional borders between stacked sections
 
 ## Summary

@@ -11,6 +11,95 @@ import threading
 import queue
 import urllib.request
 import tempfile
+import sys
+
+# TalkNet integration for audio-visual active speaker detection
+# Source: https://github.com/TaoRuijie/TalkNet-ASD
+TALKNET_AVAILABLE = False
+TALKNET_MODEL = None
+TALKNET_DEVICE = None
+
+def get_talknet_model_path():
+    """Get path to TalkNet model file. Model should be pre-downloaded during build."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Check standard locations
+    possible_paths = [
+        os.path.join(script_dir, "talknet_asd", "pretrain_TalkSet.model"),
+        os.path.join(script_dir, "pretrain_TalkSet.model"),
+        os.path.join(script_dir, "TalkNet-ASD", "pretrain_TalkSet.model"),
+    ]
+    
+    for path in possible_paths:
+        if os.path.exists(path):
+            return path
+    
+    return None
+
+
+def init_talknet():
+    """
+    Initialize TalkNet for local inference.
+    Model should be pre-downloaded during deploy (see cog.yaml).
+    """
+    global TALKNET_AVAILABLE, TALKNET_MODEL, TALKNET_DEVICE
+    
+    try:
+        import torch
+        import python_speech_features
+        
+        # Find model file
+        model_path = get_talknet_model_path()
+        if model_path is None:
+            # List what we have
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            print(f"  ⚠️  TalkNet model not found in {script_dir}")
+            talknet_dir = os.path.join(script_dir, "talknet_asd")
+            if os.path.exists(talknet_dir):
+                print(f"     talknet_asd/ exists, contents: {os.listdir(talknet_dir)}")
+            else:
+                print(f"     talknet_asd/ does not exist")
+            TALKNET_AVAILABLE = False
+            return False
+        
+        print(f"  ✓ Found model at: {model_path}")
+        
+        # Determine device
+        if torch.cuda.is_available():
+            TALKNET_DEVICE = torch.device("cuda")
+            print(f"  🚀 TalkNet will use GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            TALKNET_DEVICE = torch.device("cpu")
+            print("  💻 TalkNet will use CPU")
+        
+        # Load the model
+        TALKNET_MODEL = torch.load(model_path, map_location=TALKNET_DEVICE)
+        
+        TALKNET_AVAILABLE = True
+        return True
+        
+    except ImportError as e:
+        missing = str(e).split("'")[-2] if "'" in str(e) else "unknown"
+        print(f"  ⚠️  TalkNet dependency missing: {missing}")
+        print("     Install with: pip install torch python_speech_features")
+        TALKNET_AVAILABLE = False
+        return False
+    except Exception as e:
+        print(f"  ⚠️  TalkNet initialization failed: {e}")
+        import traceback
+        traceback.print_exc()
+        TALKNET_AVAILABLE = False
+        return False
+
+
+def check_talknet_available():
+    """Check if TalkNet dependencies are installed."""
+    try:
+        import torch
+        import python_speech_features
+        return True
+    except ImportError:
+        return False
 
 
 def extract_audio_activity(video_path, fps, total_frames, chunk_duration=0.5):
@@ -183,11 +272,232 @@ def calculate_lip_movement(mouth_regions):
     return total_movement / valid_pairs
 
 
+def extract_audio_features(video_path, scene_start_frame, scene_end_frame, fps):
+    """
+    Extract MFCC audio features from a video scene for TalkNet.
+    
+    Returns:
+        numpy array of MFCC features, or None if extraction fails
+    """
+    try:
+        import python_speech_features
+        import wave
+        
+        scene_start_time = scene_start_frame / fps
+        scene_duration = (scene_end_frame - scene_start_frame) / fps
+        
+        # Extract audio to temp WAV file
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_audio:
+            tmp_audio_path = tmp_audio.name
+        
+        cmd = [
+            'ffmpeg', '-y', '-i', video_path,
+            '-ss', str(scene_start_time), '-t', str(scene_duration),
+            '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+            tmp_audio_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            if os.path.exists(tmp_audio_path):
+                os.unlink(tmp_audio_path)
+            return None
+        
+        # Read audio
+        with wave.open(tmp_audio_path, 'rb') as wav:
+            audio_data = wav.readframes(wav.getnframes())
+            audio = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
+        
+        os.unlink(tmp_audio_path)
+        
+        if len(audio) == 0:
+            return None
+        
+        # Normalize
+        max_val = np.max(np.abs(audio))
+        if max_val > 0:
+            audio = audio / max_val
+        
+        # Extract MFCC features (TalkNet uses 13 coefficients)
+        mfcc = python_speech_features.mfcc(audio, 16000, numcep=13, winlen=0.025, winstep=0.010)
+        
+        return mfcc
+        
+    except Exception as e:
+        return None
+
+
+def compute_speaking_score(face_sequence, mfcc_features):
+    """
+    Compute a speaking score by analyzing lip movement correlation with audio.
+    
+    This is a simplified version of TalkNet's audio-visual correlation.
+    Higher scores indicate the person is more likely speaking.
+    
+    Args:
+        face_sequence: List of (mouth_region, frame_idx) tuples
+        mfcc_features: MFCC audio features array
+        
+    Returns:
+        Speaking score (0-1), higher = more likely speaking
+    """
+    if len(face_sequence) < 3 or mfcc_features is None or len(mfcc_features) < 10:
+        return 0.0
+    
+    try:
+        # Calculate lip movement variance over time
+        movements = []
+        for i in range(1, len(face_sequence)):
+            prev_mouth = face_sequence[i - 1][0]
+            curr_mouth = face_sequence[i][0]
+            
+            if prev_mouth is None or curr_mouth is None:
+                continue
+            
+            # Calculate frame difference
+            diff = cv2.absdiff(prev_mouth, curr_mouth)
+            movement = np.mean(diff)
+            movements.append(movement)
+        
+        if len(movements) < 2:
+            return 0.0
+        
+        # Speaking produces rhythmic, variable lip movement
+        movement_variance = np.var(movements)
+        movement_mean = np.mean(movements)
+        
+        # Audio energy over time (from MFCC)
+        audio_energy = np.sum(mfcc_features ** 2, axis=1)
+        audio_variance = np.var(audio_energy)
+        audio_mean = np.mean(audio_energy)
+        
+        # Correlate lip movement with audio energy
+        # Resample to match lengths
+        num_points = min(len(movements), len(audio_energy))
+        if num_points < 3:
+            return 0.0
+        
+        # Simple correlation: speaking = high audio + high lip movement
+        lip_score = min(1.0, movement_mean / 15.0)  # Normalize
+        audio_score = min(1.0, audio_mean / 50.0)   # Normalize
+        
+        # Combined score with audio-visual agreement bonus
+        if lip_score > 0.3 and audio_score > 0.3:
+            # Both modalities agree - likely speaking
+            combined_score = (lip_score + audio_score) / 2 + 0.2
+        else:
+            combined_score = (lip_score + audio_score) / 2
+        
+        return min(1.0, combined_score)
+        
+    except Exception as e:
+        return 0.0
+
+
+def detect_active_speaker_talknet(video_path, scene_start_frame, scene_end_frame, 
+                                   people_detections, fps):
+    """
+    Detect active speaker using audio-visual analysis.
+    Analyzes lip movement correlated with audio features.
+    
+    Based on TalkNet approach: https://github.com/TaoRuijie/TalkNet-ASD
+    
+    Returns:
+        Index of the active speaker in people_detections, or None if undetermined
+    """
+    if not TALKNET_AVAILABLE:
+        return None
+    
+    # Filter people with faces
+    people_with_faces = [(i, p) for i, p in enumerate(people_detections) 
+                        if p.get('face_box') is not None]
+    
+    if len(people_with_faces) == 0:
+        return None
+    
+    try:
+        # Extract audio features for the scene
+        mfcc_features = extract_audio_features(video_path, scene_start_frame, scene_end_frame, fps)
+        
+        if mfcc_features is None:
+            return None  # No audio - can't determine speaker
+        
+        # Check if there's any significant audio
+        audio_energy = np.mean(np.sum(mfcc_features ** 2, axis=1))
+        if audio_energy < 10:  # Very quiet - no one speaking
+            return None
+        
+        # Open video and sample frames
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+        
+        scene_duration = scene_end_frame - scene_start_frame
+        num_samples = min(30, max(10, scene_duration // 2))
+        sample_frames = np.linspace(scene_start_frame, scene_end_frame - 1, num_samples, dtype=int)
+        
+        # Collect mouth regions for each person
+        mouth_sequences = {i: [] for i, _ in people_with_faces}
+        
+        for frame_idx, frame_num in enumerate(sample_frames):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            ret, frame = cap.read()
+            
+            if not ret:
+                continue
+            
+            for person_idx, person in people_with_faces:
+                face_box = person['face_box']
+                mouth_region = get_mouth_region(face_box, frame)
+                mouth_sequences[person_idx].append((mouth_region, frame_idx))
+        
+        cap.release()
+        
+        # Compute speaking score for each person
+        speaking_scores = {}
+        
+        for person_idx, mouth_seq in mouth_sequences.items():
+            score = compute_speaking_score(mouth_seq, mfcc_features)
+            speaking_scores[person_idx] = score
+        
+        if not speaking_scores:
+            return None
+        
+        # Find the highest scoring person
+        best_speaker = max(speaking_scores, key=speaking_scores.get)
+        best_score = speaking_scores[best_speaker]
+        
+        # Only return if score is significant
+        if best_score < 0.4:
+            return None
+        
+        # For single person, return them if they're speaking
+        if len(people_with_faces) == 1:
+            return best_speaker if best_score > 0.4 else None
+        
+        # For multiple people, require clear winner
+        other_scores = [s for i, s in speaking_scores.items() if i != best_speaker]
+        if other_scores:
+            max_other = max(other_scores)
+            # Need to be significantly higher than others
+            if best_score < max_other * 1.5:
+                return None
+        
+        return best_speaker
+        
+    except Exception as e:
+        print(f"  ⚠️  Speaker detection failed: {e}")
+        return None
+
+
 def detect_active_speaker(video_path, scene_start_frame, scene_end_frame, people_detections, 
                           dnn_face_detector, face_cascade, fps, sample_interval=3):
     """
-    Detect who is the active speaker in a scene by analyzing lip movement
-    correlated with audio activity.
+    Detect who is the active speaker in a scene.
+    Uses TalkNet (audio-visual) if available, otherwise falls back to lip movement analysis.
+    
+    The fallback is CONSERVATIVE - only identifies a speaker when very confident,
+    otherwise returns None to allow split-screen or group tracking.
     
     Args:
         video_path: Path to video
@@ -211,9 +521,32 @@ def detect_active_speaker(video_path, scene_start_frame, scene_end_frame, people
     if len(people_with_faces) == 0:
         return None
     
+    # IMPORTANT: Don't assume single face = speaker
+    # They might just be listening! Only return speaker if we can confirm they're talking.
     if len(people_with_faces) == 1:
-        # Only one face - they're the speaker by default
-        return people_with_faces[0][0]
+        # With only one face, we can't compare - check if they're actually speaking
+        # by correlating with audio
+        audio_segments = extract_audio_activity(video_path, fps, scene_end_frame, chunk_duration=0.3)
+        if audio_segments:
+            # There's audio activity - check if this person's lips are moving during speech
+            total_energy = sum(s[2] for s in audio_segments)
+            if total_energy > 0.5:  # Significant audio
+                # Single person with significant audio - likely the speaker
+                return people_with_faces[0][0]
+        # No clear audio or no correlation - don't assume they're speaking
+        return None
+    
+    # Try TalkNet first (most accurate)
+    if TALKNET_AVAILABLE:
+        talknet_result = detect_active_speaker_talknet(
+            video_path, scene_start_frame, scene_end_frame, people_detections, fps
+        )
+        if talknet_result is not None:
+            return talknet_result
+    
+    # Fallback: Lip movement analysis with audio correlation
+    # Extract audio activity first
+    audio_segments = extract_audio_activity(video_path, fps, scene_end_frame, chunk_duration=0.3)
     
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -221,15 +554,22 @@ def detect_active_speaker(video_path, scene_start_frame, scene_end_frame, people
     
     # Collect mouth regions for each person across the scene
     mouth_sequences = {i: [] for i, _ in people_with_faces}
+    frame_audio_energy = {}  # Map frame to audio energy
     
     scene_duration = scene_end_frame - scene_start_frame
-    num_samples = min(20, scene_duration // sample_interval)  # Cap at 20 samples
+    num_samples = min(25, scene_duration // sample_interval)  # More samples for accuracy
     
-    if num_samples < 3:
+    if num_samples < 5:  # Need enough samples for reliable detection
         cap.release()
         return None
     
     sample_frames = np.linspace(scene_start_frame, scene_end_frame - 1, num_samples, dtype=int)
+    
+    # Map audio energy to frames
+    if audio_segments:
+        for start_f, end_f, energy in audio_segments:
+            for f in range(start_f, end_f + 1):
+                frame_audio_energy[f] = energy
     
     for frame_num in sample_frames:
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
@@ -241,41 +581,95 @@ def detect_active_speaker(video_path, scene_start_frame, scene_end_frame, people
         for person_idx, person in people_with_faces:
             face_box = person['face_box']
             mouth_region = get_mouth_region(face_box, frame)
-            mouth_sequences[person_idx].append(mouth_region)
+            
+            # Store with audio energy for this frame
+            audio_energy = frame_audio_energy.get(frame_num, 0.0)
+            mouth_sequences[person_idx].append((mouth_region, audio_energy))
     
     cap.release()
     
-    # Calculate lip movement for each person
+    # Calculate lip movement correlated with audio
     movement_scores = {}
-    for person_idx, mouth_regions in mouth_sequences.items():
-        # Filter out None values
-        valid_regions = [m for m in mouth_regions if m is not None]
-        if len(valid_regions) >= 2:
-            movement_scores[person_idx] = calculate_lip_movement(valid_regions)
-        else:
+    audio_correlated_scores = {}
+    
+    for person_idx, mouth_data in mouth_sequences.items():
+        valid_regions = [(m, e) for m, e in mouth_data if m is not None]
+        if len(valid_regions) < 5:
             movement_scores[person_idx] = 0.0
+            audio_correlated_scores[person_idx] = 0.0
+            continue
+        
+        # Calculate movement only during audio activity
+        audio_movement = 0.0
+        silent_movement = 0.0
+        audio_frames = 0
+        silent_frames = 0
+        
+        for i in range(1, len(valid_regions)):
+            prev_mouth, prev_energy = valid_regions[i - 1]
+            curr_mouth, curr_energy = valid_regions[i]
+            
+            diff = cv2.absdiff(prev_mouth, curr_mouth)
+            movement = np.mean(diff)
+            
+            # Separate movement during audio vs silence
+            avg_energy = (prev_energy + curr_energy) / 2
+            if avg_energy > 0.1:  # Audio active
+                audio_movement += movement
+                audio_frames += 1
+            else:
+                silent_movement += movement
+                silent_frames += 1
+        
+        movement_scores[person_idx] = (audio_movement + silent_movement) / max(1, len(valid_regions) - 1)
+        
+        # Audio-correlated score: movement during speech vs movement during silence
+        if audio_frames > 0 and silent_frames > 0:
+            avg_audio_movement = audio_movement / audio_frames
+            avg_silent_movement = silent_movement / silent_frames
+            # Speaker should move more during audio than during silence
+            audio_correlated_scores[person_idx] = avg_audio_movement - avg_silent_movement
+        elif audio_frames > 0:
+            audio_correlated_scores[person_idx] = audio_movement / audio_frames
+        else:
+            audio_correlated_scores[person_idx] = 0.0
     
     if not movement_scores:
         return None
     
-    # Find the person with most lip movement
-    max_movement = max(movement_scores.values())
+    # Use audio-correlated score if available, otherwise raw movement
+    if any(s > 0 for s in audio_correlated_scores.values()):
+        scores = audio_correlated_scores
+        threshold = 3.0  # Higher threshold for correlated scores
+        ratio_threshold = 2.0  # Need 2x more correlated movement
+    else:
+        scores = movement_scores
+        threshold = 8.0  # Higher threshold for raw movement (more conservative)
+        ratio_threshold = 2.5  # Need 2.5x more movement
     
-    if max_movement < 5.0:  # Threshold for "significant" movement
+    max_score = max(scores.values())
+    
+    if max_score < threshold:
         # No one is clearly speaking
         return None
     
-    # Check if there's a clear winner (>50% more movement than others)
-    speaker_idx = max(movement_scores, key=movement_scores.get)
-    other_movements = [v for k, v in movement_scores.items() if k != speaker_idx]
+    # Find best candidate
+    speaker_idx = max(scores, key=scores.get)
+    other_scores = [v for k, v in scores.items() if k != speaker_idx]
     
-    if other_movements:
-        avg_other = sum(other_movements) / len(other_movements)
-        if movement_scores[speaker_idx] > avg_other * 1.5:
-            return speaker_idx
+    if other_scores:
+        # Require CLEAR winner - much more conservative than before
+        max_other = max(other_scores)
+        if max_other > 0:
+            if scores[speaker_idx] / max_other < ratio_threshold:
+                # Not enough difference - can't determine speaker
+                return None
+        
+        avg_other = sum(other_scores) / len(other_scores)
+        if avg_other > 0 and scores[speaker_idx] < avg_other * ratio_threshold:
+            return None
     
-    # No clear speaker
-    return None
+    return speaker_idx
 
 
 def analyze_scene_with_speaker_detection(video_path, scene_start_time, scene_end_time, model, 
@@ -854,8 +1248,24 @@ def analyze_scene_content(video_path, scene_start_time, scene_end_time, model, f
     
     cap.release()
     
-    # If no detections from any frame, return empty
+    # If no detections from any frame, try one more time with very low threshold
     if not all_frame_detections:
+        # Last attempt with very low confidence
+        cap = cv2.VideoCapture(video_path)
+        middle_frame = int(start_frame + scene_duration / 2)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame)
+        ret, frame = cap.read()
+        cap.release()
+        
+        if ret:
+            detections = analyze_single_frame(
+                frame, model, face_cascade, dnn_face_detector,
+                analysis_scale, confidence_threshold * 0.3  # Very low threshold
+            )
+            if detections:
+                print(f"  ⚠️  Found people with low confidence ({confidence_threshold * 0.3:.2f})")
+                return detections
+        
         print("  ⚠️  No people detected in any sampled frame")
         return []
     
@@ -897,17 +1307,17 @@ def get_enclosing_box(boxes):
 def would_require_excessive_zoom(target_box, frame_width, frame_height, aspect_ratio, max_zoom=4.0):
     """
     Check if tracking this target would require excessive zoom.
-    Now uses a more lenient calculation based on target size relative to frame.
+    Very lenient - almost always allows tracking over letterbox.
     
     Args:
         target_box: Bounding box [x1, y1, x2, y2]
         frame_width: Frame width
         frame_height: Frame height
         aspect_ratio: Target aspect ratio
-        max_zoom: Maximum acceptable zoom factor (default increased to 4.0)
+        max_zoom: Maximum acceptable zoom factor (default: 4.0)
         
     Returns:
-        True if zoom would exceed max_zoom
+        True if zoom would exceed max_zoom (rarely returns True now)
     """
     target_height = target_box[3] - target_box[1]
     target_width = target_box[2] - target_box[0]
@@ -915,28 +1325,11 @@ def would_require_excessive_zoom(target_box, frame_width, frame_height, aspect_r
     if target_height <= 0 or target_width <= 0:
         return True
     
-    # Calculate crop dimensions at full frame height
-    crop_width = frame_height * aspect_ratio
-    crop_height = frame_height
+    # Very lenient: only reject if target is tiny (< 5% of frame height)
+    # This almost never triggers letterbox when something is detected
+    if target_height / frame_height < 0.05:
+        return True
     
-    # If crop fits within frame, we can track without zoom
-    if crop_width <= frame_width:
-        # Check if target is reasonably sized (at least 10% of crop area)
-        target_area = target_width * target_height
-        crop_area = crop_width * crop_height
-        
-        # Very small targets would need excessive zoom
-        min_area_ratio = 0.02  # Target should be at least 2% of crop area
-        if target_area / crop_area < min_area_ratio:
-            return True
-        
-        # Also check height ratio - target should be at least 15% of frame height
-        if target_height / frame_height < 0.15:
-            return True
-        
-        return False
-    
-    # Crop doesn't fit - would need to scale down, not zoom
     return False
 
 
@@ -1032,6 +1425,7 @@ def decide_cropping_strategy(scene_analysis, frame_height, frame_width, aspect_r
     """
     num_people = len(scene_analysis)
     if num_people == 0:
+        print(f"  ⚠️  No people detected in scene, will use fallback")
         return 'LETTERBOX', None
     
     if num_people == 1:
@@ -1577,6 +1971,146 @@ def create_stacked_frame(frame, people_data, output_width, output_height, aspect
     return output_frame
 
 
+class SmoothTracker:
+    """
+    Smooth tracking system for OpusClip-like camera movement.
+    Applies exponential smoothing to follow subjects smoothly.
+    """
+    
+    def __init__(self, smoothing=0.08):
+        """
+        Args:
+            smoothing: Lower = smoother/slower (0.05-0.15 recommended)
+        """
+        self.smoothing = smoothing
+        self.current_x = None
+        self.current_y = None
+    
+    def update(self, target_x, target_y):
+        """Update tracker with new target position, returns smoothed position."""
+        if self.current_x is None:
+            self.current_x = target_x
+            self.current_y = target_y
+        else:
+            self.current_x += self.smoothing * (target_x - self.current_x)
+            self.current_y += self.smoothing * (target_y - self.current_y)
+        
+        return self.current_x, self.current_y
+    
+    def reset(self):
+        """Reset tracker state."""
+        self.current_x = None
+        self.current_y = None
+    
+    def snap_to(self, x, y):
+        """Instantly snap to position (for scene changes)."""
+        self.current_x = x
+        self.current_y = y
+
+
+def track_subjects_in_frame(frame, model, previous_boxes=None, confidence_threshold=0.25):
+    """
+    Track any subjects (people, objects) in a frame using YOLO.
+    Returns the best target to follow.
+    
+    Args:
+        frame: Current video frame
+        model: YOLO model
+        previous_boxes: Previous frame's detections for continuity
+        confidence_threshold: Minimum detection confidence
+        
+    Returns:
+        Best target box [x1, y1, x2, y2] or None
+    """
+    results = model([frame], verbose=False)
+    
+    detections = []
+    for result in results:
+        boxes = result.boxes
+        for box in boxes:
+            cls = int(box.cls[0])
+            confidence = float(box.conf[0])
+            
+            if confidence < confidence_threshold:
+                continue
+            
+            x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
+            
+            # Prioritize people (class 0), but track other objects too
+            priority = 10 if cls == 0 else 1
+            
+            detections.append({
+                'box': [x1, y1, x2, y2],
+                'confidence': confidence,
+                'class': cls,
+                'priority': priority,
+                'area': (x2 - x1) * (y2 - y1)
+            })
+    
+    if not detections:
+        return None
+    
+    # If we have previous boxes, try to find the same subject
+    if previous_boxes:
+        best_match = None
+        best_iou = 0.2
+        
+        for det in detections:
+            for prev in previous_boxes:
+                iou = calculate_iou(det['box'], prev['box'])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_match = det
+        
+        if best_match:
+            return best_match['box']
+    
+    # Sort by priority (people first), then by area (larger = more important)
+    detections.sort(key=lambda x: (x['priority'], x['area']), reverse=True)
+    
+    return detections[0]['box']
+
+
+def calculate_iou(box1, box2):
+    """Calculate Intersection over Union between two boxes."""
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    
+    intersection = (x2 - x1) * (y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    
+    return intersection / (area1 + area2 - intersection)
+
+
+def calculate_smooth_crop(target_center_x, target_center_y, frame_width, frame_height, aspect_ratio):
+    """
+    Calculate crop box centered on a smooth target position.
+    """
+    crop_height = frame_height
+    crop_width = crop_height * aspect_ratio
+    
+    # Constrain to frame
+    if crop_width > frame_width:
+        crop_width = frame_width
+        crop_height = crop_width / aspect_ratio
+    
+    # Center on target
+    x1 = target_center_x - crop_width / 2
+    y1 = target_center_y - crop_height / 2
+    
+    # Keep within bounds
+    x1 = max(0, min(x1, frame_width - crop_width))
+    y1 = max(0, min(y1, frame_height - crop_height))
+    
+    return [int(x1), int(y1), int(x1 + crop_width), int(y1 + crop_height)]
+
+
 def get_video_resolution(video_path):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -1601,9 +2135,10 @@ def get_video_codec(video_path):
         return None
 
 
-def process_video(input_video, final_output_video, model, face_cascade, aspect_ratio=9/16, analysis_scale=1.0, use_gpu=False, confidence_threshold=0.3, use_dnn_face=True, num_sample_frames=3, detect_speaker=True, fallback_strategy='saliency'):
+def process_video(input_video, final_output_video, model, face_cascade, aspect_ratio=9/16, analysis_scale=1.0, use_gpu=False, confidence_threshold=0.3, use_dnn_face=True, num_sample_frames=3, detect_speaker=True, fallback_strategy='saliency', tracking_mode='smooth', tracking_smoothness=0.08, verbose=False):
     """
     Main video processing function that converts horizontal video to vertical format.
+    OpusClip-like quality with smooth tracking and real-time subject following.
     
     Args:
         input_video: Path to the input video file
@@ -1618,6 +2153,9 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
         num_sample_frames: Number of frames to sample per scene for detection (default: 3). More = better accuracy, slower.
         detect_speaker: Whether to detect and focus on active speaker (default: True). Analyzes lip movement.
         fallback_strategy: Strategy when no people detected ('saliency', 'center', 'letterbox'). Default: 'saliency'
+        tracking_mode: 'smooth' (real-time tracking with smoothing), 'static' (per-scene), 'fast' (real-time, less smooth). Default: 'smooth'
+        tracking_smoothness: Camera smoothness (0.05=very smooth, 0.15=responsive). Default: 0.08
+        verbose: Show detailed debug info for each scene. Default: False
     """
     script_start_time = time.time()
     
@@ -1625,6 +2163,20 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
     dnn_face_detector = None
     if use_dnn_face:
         dnn_face_detector = load_dnn_face_detector()
+    
+    # Initialize TalkNet for speaker detection
+    if detect_speaker:
+        print("🎤 Initializing speaker detection...")
+        if check_talknet_available():
+            print("  ✓ TalkNet dependencies found")
+            if init_talknet():
+                print("  ✓ TalkNet model loaded - using AI speaker detection")
+            else:
+                print("  ⚠️  TalkNet model failed to load - using fallback")
+        else:
+            print("  ⚠️  TalkNet dependencies missing - using fallback speaker detection")
+            print("     For accurate speaker detection, install:")
+            print("     pip install python_speech_features")
     
     # Define temporary file paths based on the output name
     base_name = os.path.splitext(final_output_video)[0]
@@ -1692,14 +2244,25 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
             active_speaker_idx=active_speaker_idx
         )
         
-        # If no people detected (LETTERBOX), try fallback strategy
-        if strategy == 'LETTERBOX' and fallback_strategy != 'letterbox':
-            fallback_box = compute_scene_fallback(
-                input_video, start_time, end_time, aspect_ratio, fallback_strategy
-            )
-            if fallback_box:
-                strategy = 'TRACK'
-                target_box = fallback_box
+        # If no people detected (LETTERBOX), ALWAYS try fallback strategy
+        # This ensures we almost never have letterbox unless explicitly requested
+        if strategy == 'LETTERBOX':
+            if fallback_strategy != 'letterbox':
+                fallback_box = compute_scene_fallback(
+                    input_video, start_time, end_time, aspect_ratio, fallback_strategy
+                )
+                if fallback_box:
+                    strategy = 'TRACK'
+                    target_box = fallback_box
+                else:
+                    # Even if saliency fails, use center crop
+                    print(f"  📍 Saliency failed, using center crop")
+                    fallback_box = compute_scene_fallback(
+                        input_video, start_time, end_time, aspect_ratio, 'center'
+                    )
+                    if fallback_box:
+                        strategy = 'TRACK'
+                        target_box = fallback_box
         
         scenes_analysis.append({
             'start_frame': start_time.get_frames(),
@@ -1747,8 +2310,15 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
             else:
                 print(f"  - Scene {i+1} ({start_time} -> {end_time}): {num_people} person(s) [conf: {avg_person_conf:.2f}]{frames_info}, 0 faces{speaker_info}. Strategy: {strategy}")
         else:
-            fallback_note = " (saliency)" if strategy == 'TRACK' else ""
+            fallback_note = " (saliency)" if strategy == 'TRACK' else " ⚠️ LETTERBOX"
             print(f"  - Scene {i+1} ({start_time} -> {end_time}): 0 person(s). Strategy: {strategy}{fallback_note}")
+        
+        # Verbose mode: show why each scene got its strategy
+        if verbose and num_people > 0:
+            for j, person in enumerate(scene_data['analysis']):
+                box = person['person_box']
+                box_size = f"{box[2]-box[0]}x{box[3]-box[1]}"
+                print(f"      Person {j+1}: box={box_size}, conf={person['confidence']:.2f}")
 
     print("\n✂️ Step 4: Processing video frames...")
     step_start_time = time.time()
@@ -1835,41 +2405,105 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
     frame_number = 0
     current_scene_index = 0
     
+    # Initialize smooth tracker for OpusClip-like camera movement
+    use_realtime = tracking_mode in ['smooth', 'fast']
+    smoothness = tracking_smoothness if tracking_mode == 'smooth' else 0.2
+    tracker = SmoothTracker(smoothing=smoothness)
+    
+    # For real-time tracking
+    previous_detections = None
+    track_interval = 3 if tracking_mode == 'smooth' else 6  # Detect every N frames
+    last_detected_box = None
+    
     # Pre-allocate letterbox frame to avoid repeated allocations
     letterbox_frame = np.zeros((OUTPUT_HEIGHT, OUTPUT_WIDTH, 3), dtype=np.uint8)
     
-    with tqdm(total=total_frames, desc="Applying Plan", smoothing=0.1) as pbar:
+    mode_desc = {
+        'smooth': '🎬 OpusClip-like smooth tracking',
+        'fast': '⚡ Fast tracking',
+        'static': '📌 Static per-scene'
+    }
+    print(f"  {mode_desc.get(tracking_mode, '📌 Static')}...")
+    
+    with tqdm(total=total_frames, desc="Processing", smoothing=0.1) as pbar:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
+            # Detect scene change
+            prev_scene = current_scene_index
             if current_scene_index < len(scenes_analysis) - 1 and \
                frame_number >= scenes_analysis[current_scene_index + 1]['start_frame']:
                 current_scene_index += 1
+                # Reset tracking on scene change
+                previous_detections = None
+                last_detected_box = None
 
             scene_data = scenes_analysis[current_scene_index]
             strategy = scene_data['strategy']
             target_box = scene_data['target_box']
 
             if strategy == 'TRACK':
-                crop_box = calculate_crop_box(target_box, original_width, original_height, aspect_ratio)
-                processed_frame = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
-                output_frame = resize_cover(processed_frame, OUTPUT_WIDTH, OUTPUT_HEIGHT)
+                # Real-time tracking: detect subject position every few frames
+                if use_realtime and frame_number % track_interval == 0:
+                    detected = track_subjects_in_frame(
+                        frame, model, 
+                        [{'box': last_detected_box}] if last_detected_box else None,
+                        confidence_threshold * 0.8
+                    )
+                    if detected:
+                        last_detected_box = detected
+                        previous_detections = [{'box': detected}]
+                
+                # Use real-time detection or fallback to scene analysis
+                current_target = last_detected_box if last_detected_box else target_box
+                
+                # Calculate target center
+                target_cx = (current_target[0] + current_target[2]) / 2
+                target_cy = (current_target[1] + current_target[3]) / 2
+                
+                # Apply smooth tracking
+                if tracking_mode == 'static':
+                    smooth_cx, smooth_cy = target_cx, target_cy
+                else:
+                    # On scene change, snap to new position then smooth
+                    if prev_scene != current_scene_index:
+                        tracker.snap_to(target_cx, target_cy)
+                    smooth_cx, smooth_cy = tracker.update(target_cx, target_cy)
+                
+                # Calculate smooth crop
+                crop_box = calculate_smooth_crop(
+                    smooth_cx, smooth_cy, 
+                    original_width, original_height, aspect_ratio
+                )
+                
+                # Extract and resize
+                x1, y1, x2, y2 = crop_box
+                processed_frame = frame[y1:y2, x1:x2]
+                if processed_frame.size > 0:
+                    output_frame = resize_cover(processed_frame, OUTPUT_WIDTH, OUTPUT_HEIGHT)
+                else:
+                    output_frame = letterbox_frame.copy()
+                    
             elif strategy == 'STACK':
-                # Stack multiple people vertically
-                people_data = target_box  # target_box contains the list of people for STACK strategy
+                # Stack multiple people
+                people_data = target_box
                 output_frame = create_stacked_frame(frame, people_data, OUTPUT_WIDTH, OUTPUT_HEIGHT, aspect_ratio)
+                tracker.reset()
+                last_detected_box = None
+                
             else:  # LETTERBOX
                 scale_factor = OUTPUT_WIDTH / original_width
                 scaled_height = int(original_height * scale_factor)
                 scaled_frame = cv2.resize(frame, (OUTPUT_WIDTH, scaled_height), interpolation=cv2.INTER_LINEAR)
                 
-                # Reuse pre-allocated frame and clear it
                 letterbox_frame.fill(0)
                 y_offset = (OUTPUT_HEIGHT - scaled_height) // 2
                 letterbox_frame[y_offset:y_offset + scaled_height, :] = scaled_frame
                 output_frame = letterbox_frame
+                tracker.reset()
+                last_detected_box = None
             
             # Write to FFmpeg pipe
             try:
@@ -1881,7 +2515,7 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
             frame_number += 1
             pbar.update(1)
             
-            # Explicit cleanup every 1000 frames to prevent memory buildup
+            # Cleanup every 1000 frames
             if frame_number % 1000 == 0:
                 del frame
                 if strategy == 'TRACK':

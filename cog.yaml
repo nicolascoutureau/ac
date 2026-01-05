@@ -20,9 +20,16 @@ build:
   python_requirements: requirements.txt
 
   # commands run after the environment is setup
-  # Pre-download all YOLO models during build to avoid setup timeouts
+  # Pre-download all models during build to avoid runtime delays
   run:
-    - 'python -c ''from ultralytics import YOLO; print("Downloading YOLO models..."); YOLO("yolov8x.pt"); YOLO("yolov8m.pt"); YOLO("yolov8s.pt"); print("All models downloaded!")'''
+    # Install gdown for Google Drive downloads
+    - pip install gdown
+    # Download YOLO models
+    - 'python -c ''from ultralytics import YOLO; print("Downloading YOLO models..."); YOLO("yolov8x.pt"); YOLO("yolov8m.pt"); YOLO("yolov8s.pt"); print("All YOLO models downloaded!")'''
+    # Download TalkNet model for speaker detection (from Google Drive)
+    - 'mkdir -p talknet_asd && gdown 1AbN9fCf9IexMxEKXLQY2KYBlb-IhSEea -O talknet_asd/pretrain_TalkSet.model && echo "TalkNet model downloaded!"'
+    # Download DNN face detector
+    - 'curl -L -o deploy.prototxt "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt" && curl -L -o res10_300x300_ssd_iter_140000.caffemodel "https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel" && echo "DNN face detector downloaded!"'
 
 # predict.py defines how predictions are run on your model
 predict: "predict.py:Predictor"

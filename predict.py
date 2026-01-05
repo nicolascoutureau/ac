@@ -71,6 +71,15 @@ class Predictor(BasePredictor):
             choices=["quality", "balanced", "fast"],
             default="balanced"
         ),
+        detect_speaker: bool = Input(
+            description="Detect and focus on the active speaker using TalkNet AI. When multiple people are detected, focuses on who is speaking instead of split-screen.",
+            default=True
+        ),
+        tracking_mode: str = Input(
+            description="Camera tracking mode. Smooth = cinematic OpusClip-like movement. Static = fixed per-scene.",
+            choices=["smooth", "static", "fast"],
+            default="smooth"
+        ),
     ) -> Path:
         """Run a single prediction on the model"""
         output_path = None
@@ -80,6 +89,8 @@ class Predictor(BasePredictor):
             print(f"  Input: {video}")
             print(f"  Aspect ratio: {aspect_ratio}")
             print(f"  Speed preset: {speed_preset}")
+            print(f"  Speaker detection: {'TalkNet (local)' if detect_speaker else 'Disabled'}")
+            print(f"  Tracking mode: {tracking_mode}")
             
             # Select model based on speed preset
             model = self.models[speed_preset]
@@ -118,7 +129,9 @@ class Predictor(BasePredictor):
                 face_cascade=self.face_cascade,
                 aspect_ratio=aspect_ratio_numeric,
                 analysis_scale=analysis_scale[speed_preset],
-                use_gpu=self.has_gpu
+                use_gpu=self.has_gpu,
+                detect_speaker=detect_speaker,
+                tracking_mode=tracking_mode
             )
             
             # Verify output was created
