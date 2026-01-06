@@ -1804,6 +1804,7 @@ def detect_scenes(video_path):
 
 
 def get_enclosing_box(boxes):
+    """Get the smallest box that encloses all given boxes."""
     if not boxes:
         return None
     min_x = min(box[0] for box in boxes)
@@ -1811,6 +1812,54 @@ def get_enclosing_box(boxes):
     max_x = max(box[2] for box in boxes)
     max_y = max(box[3] for box in boxes)
     return [min_x, min_y, max_x, max_y]
+
+
+def get_centered_group_box(boxes, frame_width, frame_height):
+    """
+    Get an enclosing box that centers the group of people.
+    Instead of just bounding box, this creates a box centered on the 
+    midpoint between all people, ensuring they're centered in the crop.
+    """
+    if not boxes:
+        return None
+    
+    if len(boxes) == 1:
+        return boxes[0]
+    
+    # Find the center of each person
+    centers = []
+    for box in boxes:
+        cx = (box[0] + box[2]) / 2
+        cy = (box[1] + box[3]) / 2
+        centers.append((cx, cy))
+    
+    # Calculate midpoint between all centers
+    mid_x = sum(c[0] for c in centers) / len(centers)
+    mid_y = sum(c[1] for c in centers) / len(centers)
+    
+    # Get the enclosing box dimensions
+    min_x = min(box[0] for box in boxes)
+    min_y = min(box[1] for box in boxes)
+    max_x = max(box[2] for box in boxes)
+    max_y = max(box[3] for box in boxes)
+    
+    box_width = max_x - min_x
+    box_height = max_y - min_y
+    
+    # Create a new box centered on the midpoint but with same dimensions
+    # This ensures people are centered rather than offset
+    new_x1 = mid_x - box_width / 2
+    new_y1 = mid_y - box_height / 2
+    new_x2 = mid_x + box_width / 2
+    new_y2 = mid_y + box_height / 2
+    
+    # Ensure the box still contains all people (expand if needed)
+    new_x1 = min(new_x1, min_x)
+    new_y1 = min(new_y1, min_y)
+    new_x2 = max(new_x2, max_x)
+    new_y2 = max(new_y2, max_y)
+    
+    return [new_x1, new_y1, new_x2, new_y2]
 
 
 def would_require_excessive_zoom(target_box, frame_width, frame_height, aspect_ratio, max_zoom=4.0):
@@ -1992,29 +2041,33 @@ def decide_cropping_strategy(scene_analysis, frame_height, frame_width, aspect_r
     # Multiple people detected - sort by confidence and take top detections
     sorted_by_confidence = sorted(scene_analysis, key=lambda x: x['confidence'], reverse=True)
     
+    # No split-screen for square format (1:1) - not enough vertical space
+    is_square_format = 0.9 <= aspect_ratio <= 1.1
+    
     # For 2-3 people, try to include them all
     people_to_track = sorted_by_confidence[:min(3, num_people)]
     
     person_boxes = [obj['person_box'] for obj in people_to_track]
-    group_box = get_enclosing_box(person_boxes)
+    # Use centered group box to center the people in the frame
+    group_box = get_centered_group_box(person_boxes, frame_width, frame_height)
     group_width = group_box[2] - group_box[0]
     max_width_for_crop = frame_height * aspect_ratio
     
-    # If people fit horizontally, track the group
+    # If people fit horizontally, track the group (centered)
     if group_width < max_width_for_crop * 1.2:  # Allow 20% overflow (will be handled by crop)
         # Check if group is reasonably sized
         if not would_require_excessive_zoom(group_box, frame_width, frame_height, aspect_ratio, max_zoom):
             return 'TRACK', group_box
     
     # If exactly 2 people are too far apart for single crop, consider stacking
-    if num_people == 2:
+    # But NOT for square format - split-screen doesn't work well
+    if num_people == 2 and not is_square_format:
         person1, person2 = scene_analysis[0], scene_analysis[1]
         
         # Check if people are too close for split-screen
         if are_people_too_close_for_split(person1, person2, frame_width, frame_height, aspect_ratio):
             # People are too close - track the most confident person only
             best_person = sorted_by_confidence[0]
-            print(f"  ⚠️  People too close for split-screen, tracking single person")
             return 'TRACK', best_person['person_box']
         
         # Check if people are reasonably sized for stacking
@@ -2040,11 +2093,16 @@ def decide_cropping_strategy(scene_analysis, frame_height, frame_width, aspect_r
     if num_people >= 3:
         top_two = sorted_by_confidence[:2]
         two_person_boxes = [obj['person_box'] for obj in top_two]
-        two_group_box = get_enclosing_box(two_person_boxes)
+        # Use centered group box to center both people
+        two_group_box = get_centered_group_box(two_person_boxes, frame_width, frame_height)
         two_group_width = two_group_box[2] - two_group_box[0]
         
         if two_group_width < max_width_for_crop:
             return 'TRACK', two_group_box
+        
+        # No split-screen for square format
+        if is_square_format:
+            return 'TRACK', sorted_by_confidence[0]['person_box']
         
         # Check if top 2 are too close for split
         if are_people_too_close_for_split(top_two[0], top_two[1], frame_width, frame_height, aspect_ratio):
