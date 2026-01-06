@@ -1869,8 +1869,7 @@ def calculate_overlap_ratio(box1, box2):
 def are_people_too_close_for_split(person1, person2, frame_width, frame_height, aspect_ratio):
     """
     Check if two people are too close together for split-screen to work well.
-    If their crops would overlap significantly, split-screen won't look good.
-    Also checks if both people are centered (crops would be too similar).
+    If their crops would overlap significantly or look too similar, split-screen won't look good.
     
     Returns True if split-screen would look bad (should track one instead)
     """
@@ -1879,22 +1878,28 @@ def are_people_too_close_for_split(person1, person2, frame_width, frame_height, 
     
     # Check direct overlap of person boxes
     direct_overlap = calculate_overlap_ratio(box1, box2)
-    if direct_overlap > 0.3:  # More than 30% overlap
+    if direct_overlap > 0.2:  # More than 20% overlap (stricter)
+        print(f"  ⚠️  Person boxes overlap too much ({direct_overlap:.0%})")
         return True
     
     # Check horizontal separation - for split to work, people need horizontal space
     center1_x = (box1[0] + box1[2]) / 2
     center2_x = (box2[0] + box2[2]) / 2
     
+    # STRICT: Minimum horizontal distance required for split-screen
+    # People must be at least 30% of frame width apart
+    horizontal_distance = abs(center1_x - center2_x) / frame_width
+    if horizontal_distance < 0.30:
+        print(f"  ⚠️  People too close horizontally ({horizontal_distance:.0%} apart, need 30%+)")
+        return True
+    
     # Calculate how wide each person's crop would be
-    # For split-screen, each person gets a crop that's approximately:
-    # crop_width = person_height * 1.5 * section_aspect_ratio (rough estimate)
     person1_height = box1[3] - box1[1]
     person2_height = box2[3] - box2[1]
     
     # Section aspect for vertical stacking (9:16 split in half vertically)
     if aspect_ratio < 0.8:  # Vertical output
-        section_aspect = aspect_ratio * 2  # Each section is wider relative to its height
+        section_aspect = aspect_ratio * 2
     else:
         section_aspect = aspect_ratio / 2
     
@@ -1917,30 +1922,28 @@ def are_people_too_close_for_split(person1, person2, frame_width, frame_height, 
         smaller_crop_width = min(crop_width1, crop_width2)
         crop_overlap_ratio = overlap_width / smaller_crop_width if smaller_crop_width > 0 else 0
         
-        if crop_overlap_ratio > 0.5:  # More than 50% crop overlap
+        if crop_overlap_ratio > 0.3:  # More than 30% crop overlap (stricter)
+            print(f"  ⚠️  Crop regions would overlap too much ({crop_overlap_ratio:.0%})")
             return True
     
-    # NEW: Check if both crops would show similar content (both people near center)
-    # If both people are centered horizontally, both crops would look almost identical
+    # Check if both people are too centered (crops would show same content)
     frame_center_x = frame_width / 2
     dist1_from_center = abs(center1_x - frame_center_x) / frame_width
     dist2_from_center = abs(center2_x - frame_center_x) / frame_width
     
-    # If both people are within 20% of center, crops would be too similar
-    if dist1_from_center < 0.20 and dist2_from_center < 0.20:
+    # If both people are within 35% of center, crops would be too similar
+    if dist1_from_center < 0.35 and dist2_from_center < 0.35:
         print(f"  ⚠️  Both people too centered, crops would be similar")
         return True
     
-    # Check if people are on same side of frame (crops would show same background)
+    # Check if people are on same side of frame
     same_side = (center1_x < frame_center_x and center2_x < frame_center_x) or \
                 (center1_x > frame_center_x and center2_x > frame_center_x)
     
-    # If both on same side AND close together, crops would be too similar
+    # If both on same side, crops would show similar background
     if same_side:
-        horizontal_distance = abs(center1_x - center2_x) / frame_width
-        if horizontal_distance < 0.25:  # Less than 25% of frame apart
-            print(f"  ⚠️  People on same side and close, crops would be similar")
-            return True
+        print(f"  ⚠️  Both people on same side of frame, crops would be similar")
+        return True
     
     return False
 
