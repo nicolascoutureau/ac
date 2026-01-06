@@ -19,6 +19,7 @@ TALKNET_AVAILABLE = False
 TALKNET_MODEL = None
 TALKNET_DEVICE = None
 
+
 def get_talknet_model_path():
     """Get path to TalkNet model file. Model should be pre-downloaded during build."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -37,6 +38,335 @@ def get_talknet_model_path():
     return None
 
 
+def build_talknet_model():
+    """
+    Build the TalkNet model architecture for inference.
+    This creates the actual neural network that will be used for speaker detection.
+    """
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    
+    # ============= Audio Encoder Components =============
+    class SELayer(nn.Module):
+        def __init__(self, channel, reduction=8):
+            super(SELayer, self).__init__()
+            self.avg_pool = nn.AdaptiveAvgPool2d(1)
+            self.fc = nn.Sequential(
+                nn.Linear(channel, channel // reduction),
+                nn.ReLU(inplace=True),
+                nn.Linear(channel // reduction, channel),
+                nn.Sigmoid()
+            )
+
+        def forward(self, x):
+            b, c, _, _ = x.size()
+            y = self.avg_pool(x).view(b, c)
+            y = self.fc(y).view(b, c, 1, 1)
+            return x * y
+
+    class SEBasicBlock(nn.Module):
+        expansion = 1
+
+        def __init__(self, inplanes, planes, stride=1, downsample=None, reduction=8):
+            super(SEBasicBlock, self).__init__()
+            self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+            self.bn1 = nn.BatchNorm2d(planes)
+            self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, padding=1, bias=False)
+            self.bn2 = nn.BatchNorm2d(planes)
+            self.relu = nn.ReLU(inplace=True)
+            self.se = SELayer(planes, reduction)
+            self.downsample = downsample
+            self.stride = stride
+
+        def forward(self, x):
+            residual = x
+            out = self.conv1(x)
+            out = self.relu(out)
+            out = self.bn1(out)
+            out = self.conv2(out)
+            out = self.bn2(out)
+            out = self.se(out)
+            if self.downsample is not None:
+                residual = self.downsample(x)
+            out += residual
+            out = self.relu(out)
+            return out
+
+    class AudioEncoder(nn.Module):
+        def __init__(self, layers=[3, 4, 6, 3], num_filters=[16, 32, 64, 128]):
+            super(AudioEncoder, self).__init__()
+            block = SEBasicBlock
+            self.inplanes = num_filters[0]
+            self.conv1 = nn.Conv2d(1, num_filters[0], kernel_size=7, stride=(2, 1), padding=3, bias=False)
+            self.bn1 = nn.BatchNorm2d(num_filters[0])
+            self.relu = nn.ReLU(inplace=True)
+            self.layer1 = self._make_layer(block, num_filters[0], layers[0])
+            self.layer2 = self._make_layer(block, num_filters[1], layers[1], stride=(2, 2))
+            self.layer3 = self._make_layer(block, num_filters[2], layers[2], stride=(2, 2))
+            self.layer4 = self._make_layer(block, num_filters[3], layers[3], stride=(1, 1))
+
+        def _make_layer(self, block, planes, blocks, stride=1):
+            downsample = None
+            if stride != 1 or self.inplanes != planes * block.expansion:
+                downsample = nn.Sequential(
+                    nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
+                    nn.BatchNorm2d(planes * block.expansion),
+                )
+            layers = []
+            layers.append(block(self.inplanes, planes, stride, downsample))
+            self.inplanes = planes * block.expansion
+            for i in range(1, blocks):
+                layers.append(block(self.inplanes, planes))
+            return nn.Sequential(*layers)
+
+        def forward(self, x):
+            x = self.conv1(x)
+            x = self.bn1(x)
+            x = self.relu(x)
+            x = self.layer1(x)
+            x = self.layer2(x)
+            x = self.layer3(x)
+            x = self.layer4(x)
+            x = torch.mean(x, dim=2, keepdim=True)
+            x = x.view((x.size()[0], x.size()[1], -1))
+            x = x.transpose(1, 2)
+            return x
+
+    # ============= Visual Encoder Components =============
+    class ResNetLayer(nn.Module):
+        def __init__(self, inplanes, outplanes, stride):
+            super(ResNetLayer, self).__init__()
+            self.conv1a = nn.Conv2d(inplanes, outplanes, kernel_size=3, stride=stride, padding=1, bias=False)
+            self.bn1a = nn.BatchNorm2d(outplanes, momentum=0.01, eps=0.001)
+            self.conv2a = nn.Conv2d(outplanes, outplanes, kernel_size=3, stride=1, padding=1, bias=False)
+            self.stride = stride
+            self.downsample = nn.Conv2d(inplanes, outplanes, kernel_size=(1, 1), stride=stride, bias=False)
+            self.outbna = nn.BatchNorm2d(outplanes, momentum=0.01, eps=0.001)
+            self.conv1b = nn.Conv2d(outplanes, outplanes, kernel_size=3, stride=1, padding=1, bias=False)
+            self.bn1b = nn.BatchNorm2d(outplanes, momentum=0.01, eps=0.001)
+            self.conv2b = nn.Conv2d(outplanes, outplanes, kernel_size=3, stride=1, padding=1, bias=False)
+            self.outbnb = nn.BatchNorm2d(outplanes, momentum=0.01, eps=0.001)
+
+        def forward(self, inputBatch):
+            batch = F.relu(self.bn1a(self.conv1a(inputBatch)))
+            batch = self.conv2a(batch)
+            if self.stride == 1:
+                residualBatch = inputBatch
+            else:
+                residualBatch = self.downsample(inputBatch)
+            batch = batch + residualBatch
+            intermediateBatch = batch
+            batch = F.relu(self.outbna(batch))
+            batch = F.relu(self.bn1b(self.conv1b(batch)))
+            batch = self.conv2b(batch)
+            residualBatch = intermediateBatch
+            batch = batch + residualBatch
+            outputBatch = F.relu(self.outbnb(batch))
+            return outputBatch
+
+    class ResNet(nn.Module):
+        def __init__(self):
+            super(ResNet, self).__init__()
+            self.layer1 = ResNetLayer(64, 64, stride=1)
+            self.layer2 = ResNetLayer(64, 128, stride=2)
+            self.layer3 = ResNetLayer(128, 256, stride=2)
+            self.layer4 = ResNetLayer(256, 512, stride=2)
+            self.avgpool = nn.AvgPool2d(kernel_size=(4, 4), stride=(1, 1))
+
+        def forward(self, inputBatch):
+            batch = self.layer1(inputBatch)
+            batch = self.layer2(batch)
+            batch = self.layer3(batch)
+            batch = self.layer4(batch)
+            outputBatch = self.avgpool(batch)
+            return outputBatch
+
+    class GlobalLayerNorm(nn.Module):
+        def __init__(self, channel_size):
+            super(GlobalLayerNorm, self).__init__()
+            self.gamma = nn.Parameter(torch.Tensor(1, channel_size, 1))
+            self.beta = nn.Parameter(torch.Tensor(1, channel_size, 1))
+            self.reset_parameters()
+
+        def reset_parameters(self):
+            self.gamma.data.fill_(1)
+            self.beta.data.zero_()
+
+        def forward(self, y):
+            mean = y.mean(dim=1, keepdim=True).mean(dim=2, keepdim=True)
+            var = (torch.pow(y - mean, 2)).mean(dim=1, keepdim=True).mean(dim=2, keepdim=True)
+            gLN_y = self.gamma * (y - mean) / torch.pow(var + 1e-8, 0.5) + self.beta
+            return gLN_y
+
+    class VisualFrontend(nn.Module):
+        def __init__(self):
+            super(VisualFrontend, self).__init__()
+            self.frontend3D = nn.Sequential(
+                nn.Conv3d(1, 64, kernel_size=(5, 7, 7), stride=(1, 2, 2), padding=(2, 3, 3), bias=False),
+                nn.BatchNorm3d(64, momentum=0.01, eps=0.001),
+                nn.ReLU(),
+                nn.MaxPool3d(kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1))
+            )
+            self.resnet = ResNet()
+
+        def forward(self, inputBatch):
+            inputBatch = inputBatch.transpose(0, 1).transpose(1, 2)
+            batchsize = inputBatch.shape[0]
+            batch = self.frontend3D(inputBatch)
+            batch = batch.transpose(1, 2)
+            batch = batch.reshape(batch.shape[0] * batch.shape[1], batch.shape[2], batch.shape[3], batch.shape[4])
+            outputBatch = self.resnet(batch)
+            outputBatch = outputBatch.reshape(batchsize, -1, 512)
+            outputBatch = outputBatch.transpose(1, 2)
+            outputBatch = outputBatch.transpose(1, 2).transpose(0, 1)
+            return outputBatch
+
+    class DSConv1d(nn.Module):
+        def __init__(self):
+            super(DSConv1d, self).__init__()
+            self.net = nn.Sequential(
+                nn.ReLU(),
+                nn.BatchNorm1d(512),
+                nn.Conv1d(512, 512, 3, stride=1, padding=1, dilation=1, groups=512, bias=False),
+                nn.PReLU(),
+                GlobalLayerNorm(512),
+                nn.Conv1d(512, 512, 1, bias=False),
+            )
+
+        def forward(self, x):
+            out = self.net(x)
+            return out + x
+
+    class VisualTCN(nn.Module):
+        def __init__(self):
+            super(VisualTCN, self).__init__()
+            stacks = []
+            for x in range(5):
+                stacks += [DSConv1d()]
+            self.net = nn.Sequential(*stacks)
+
+        def forward(self, x):
+            out = self.net(x)
+            return out
+
+    class VisualConv1D(nn.Module):
+        def __init__(self):
+            super(VisualConv1D, self).__init__()
+            self.net = nn.Sequential(
+                nn.Conv1d(512, 256, 5, stride=1, padding=2),
+                nn.BatchNorm1d(256),
+                nn.ReLU(),
+                nn.Conv1d(256, 128, 1),
+            )
+
+        def forward(self, x):
+            out = self.net(x)
+            return out
+
+    # ============= Attention Layer =============
+    class AttentionLayer(nn.Module):
+        def __init__(self, d_model, nhead, dropout=0.1):
+            super(AttentionLayer, self).__init__()
+            self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+            self.linear1 = nn.Linear(d_model, d_model * 4)
+            self.dropout = nn.Dropout(dropout)
+            self.linear2 = nn.Linear(d_model * 4, d_model)
+            self.norm1 = nn.LayerNorm(d_model)
+            self.norm2 = nn.LayerNorm(d_model)
+            self.dropout1 = nn.Dropout(dropout)
+            self.dropout2 = nn.Dropout(dropout)
+            self.activation = F.relu
+
+        def forward(self, src, tar):
+            src = src.transpose(0, 1)
+            tar = tar.transpose(0, 1)
+            src2 = self.self_attn(tar, src, src, attn_mask=None, key_padding_mask=None)[0]
+            src = src + self.dropout1(src2)
+            src = self.norm1(src)
+            src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+            src = src + self.dropout2(src2)
+            src = self.norm2(src)
+            src = src.transpose(0, 1)
+            return src
+
+    # ============= Main TalkNet Model =============
+    class TalkNetModel(nn.Module):
+        def __init__(self):
+            super(TalkNetModel, self).__init__()
+            self.visualFrontend = VisualFrontend()
+            self.visualTCN = VisualTCN()
+            self.visualConv1D = VisualConv1D()
+            self.audioEncoder = AudioEncoder(layers=[3, 4, 6, 3], num_filters=[16, 32, 64, 128])
+            self.crossA2V = AttentionLayer(d_model=128, nhead=8)
+            self.crossV2A = AttentionLayer(d_model=128, nhead=8)
+            self.selfAV = AttentionLayer(d_model=256, nhead=8)
+
+        def forward_visual_frontend(self, x):
+            B, T, W, H = x.shape
+            x = x.view(B * T, 1, 1, W, H)
+            x = (x / 255 - 0.4161) / 0.1688
+            x = self.visualFrontend(x)
+            x = x.view(B, T, 512)
+            x = x.transpose(1, 2)
+            x = self.visualTCN(x)
+            x = self.visualConv1D(x)
+            x = x.transpose(1, 2)
+            return x
+
+        def forward_audio_frontend(self, x):
+            x = x.unsqueeze(1).transpose(2, 3)
+            x = self.audioEncoder(x)
+            return x
+
+        def forward_cross_attention(self, x1, x2):
+            x1_c = self.crossA2V(src=x1, tar=x2)
+            x2_c = self.crossV2A(src=x2, tar=x1)
+            return x1_c, x2_c
+
+        def forward_audio_visual_backend(self, x1, x2):
+            x = torch.cat((x1, x2), 2)
+            x = self.selfAV(src=x, tar=x)
+            x = torch.reshape(x, (-1, 256))
+            return x
+
+    # ============= Loss/Classification Layer =============
+    class LossAV(nn.Module):
+        def __init__(self):
+            super(LossAV, self).__init__()
+            self.FC = nn.Linear(256, 2)
+
+        def forward(self, x, labels=None):
+            x = x.squeeze(1)
+            x = self.FC(x)
+            if labels is None:
+                predScore = x[:, 1]
+                predScore = predScore.t()
+                predScore = predScore.view(-1).detach().cpu().numpy()
+                return predScore
+            else:
+                predScore = F.softmax(x, dim=-1)
+                return predScore
+
+    # ============= Full TalkNet =============
+    class TalkNet(nn.Module):
+        def __init__(self):
+            super(TalkNet, self).__init__()
+            self.model = TalkNetModel()
+            self.lossAV = LossAV()
+
+        def forward(self, audioFeature, videoFeature):
+            """Run inference and return speaking scores."""
+            audioEmbed = self.model.forward_audio_frontend(audioFeature)
+            visualEmbed = self.model.forward_visual_frontend(videoFeature)
+            audioEmbed, visualEmbed = self.model.forward_cross_attention(audioEmbed, visualEmbed)
+            outsAV = self.model.forward_audio_visual_backend(audioEmbed, visualEmbed)
+            scores = self.lossAV.forward(outsAV, labels=None)
+            return scores
+
+    return TalkNet()
+
+
 def init_talknet():
     """
     Initialize TalkNet for local inference.
@@ -51,7 +381,6 @@ def init_talknet():
         # Find model file
         model_path = get_talknet_model_path()
         if model_path is None:
-            # List what we have
             script_dir = os.path.dirname(os.path.abspath(__file__))
             print(f"  ⚠️  TalkNet model not found in {script_dir}")
             talknet_dir = os.path.join(script_dir, "talknet_asd")
@@ -72,9 +401,28 @@ def init_talknet():
             TALKNET_DEVICE = torch.device("cpu")
             print("  💻 TalkNet will use CPU")
         
-        # Load the model
-        TALKNET_MODEL = torch.load(model_path, map_location=TALKNET_DEVICE)
+        # Build the model architecture
+        print("  🔧 Building TalkNet model architecture...")
+        TALKNET_MODEL = build_talknet_model()
         
+        # Load pretrained weights
+        print("  📥 Loading pretrained weights...")
+        state_dict = torch.load(model_path, map_location=TALKNET_DEVICE)
+        
+        # Handle different state dict formats
+        model_state = TALKNET_MODEL.state_dict()
+        for name, param in state_dict.items():
+            # Remove 'module.' prefix if present (from DataParallel)
+            clean_name = name.replace("module.", "")
+            if clean_name in model_state:
+                if model_state[clean_name].size() == param.size():
+                    model_state[clean_name].copy_(param)
+        
+        TALKNET_MODEL.load_state_dict(model_state)
+        TALKNET_MODEL = TALKNET_MODEL.to(TALKNET_DEVICE)
+        TALKNET_MODEL.eval()
+        
+        print("  ✓ TalkNet model loaded successfully!")
         TALKNET_AVAILABLE = True
         return True
         
@@ -272,28 +620,24 @@ def calculate_lip_movement(mouth_regions):
     return total_movement / valid_pairs
 
 
-def extract_audio_features(video_path, scene_start_frame, scene_end_frame, fps):
+def extract_scene_audio(video_path, start_time, duration):
     """
-    Extract MFCC audio features from a video scene for TalkNet.
+    Extract audio for entire scene ONCE.
     
     Returns:
-        numpy array of MFCC features, or None if extraction fails
+        Audio array (16kHz mono) or None if extraction fails
     """
     try:
-        import python_speech_features
         import wave
         
-        scene_start_time = scene_start_frame / fps
-        scene_duration = (scene_end_frame - scene_start_frame) / fps
-        
-        # Extract audio to temp WAV file
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_audio:
             tmp_audio_path = tmp_audio.name
         
         cmd = [
             'ffmpeg', '-y', '-i', video_path,
-            '-ss', str(scene_start_time), '-t', str(scene_duration),
+            '-ss', str(start_time), '-t', str(duration),
             '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+            '-loglevel', 'error',
             tmp_audio_path
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -303,191 +647,404 @@ def extract_audio_features(video_path, scene_start_frame, scene_end_frame, fps):
                 os.unlink(tmp_audio_path)
             return None
         
-        # Read audio
         with wave.open(tmp_audio_path, 'rb') as wav:
             audio_data = wav.readframes(wav.getnframes())
             audio = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
         
         os.unlink(tmp_audio_path)
         
-        if len(audio) == 0:
-            return None
-        
-        # Normalize
-        max_val = np.max(np.abs(audio))
-        if max_val > 0:
-            audio = audio / max_val
-        
-        # Extract MFCC features (TalkNet uses 13 coefficients)
-        mfcc = python_speech_features.mfcc(audio, 16000, numcep=13, winlen=0.025, winstep=0.010)
-        
-        return mfcc
+        return audio if len(audio) > 0 else None
         
     except Exception as e:
         return None
 
 
-def compute_speaking_score(face_sequence, mfcc_features):
+def extract_scene_frames_cached(video_path, start_frame, end_frame, fps, target_fps=25):
     """
-    Compute a speaking score by analyzing lip movement correlation with audio.
+    Extract and cache all frames for a scene ONCE.
+    Samples at target_fps (default 25fps for TalkNet).
     
-    This is a simplified version of TalkNet's audio-visual correlation.
-    Higher scores indicate the person is more likely speaking.
+    Returns:
+        List of (frame_num, frame) tuples
+    """
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return []
+        
+        # Sample at target fps
+        frame_step = max(1, int(fps / target_fps))
+        
+        cached_frames = []
+        for frame_num in range(start_frame, end_frame, frame_step):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            ret, frame = cap.read()
+            if ret:
+                cached_frames.append((frame_num, frame))
+        
+        cap.release()
+        return cached_frames
+        
+    except Exception as e:
+        return []
+
+
+def extract_face_crop_from_frame(frame, face_box):
+    """
+    Extract TalkNet-formatted face crop from a single cached frame.
+    Returns 112x112 grayscale crop.
+    """
+    try:
+        x1, y1, x2, y2 = face_box
+        face_width = x2 - x1
+        face_height = y2 - y1
+        
+        if face_width <= 0 or face_height <= 0:
+            return None
+        
+        # Expand face box (TalkNet uses 40% crop scale)
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+        box_size = max(face_width, face_height) * 1.4
+        
+        h, w = frame.shape[:2]
+        crop_x1 = int(max(0, center_x - box_size / 2))
+        crop_y1 = int(max(0, center_y - box_size / 2))
+        crop_x2 = int(min(w, center_x + box_size / 2))
+        crop_y2 = int(min(h, center_y + box_size / 2))
+        
+        face_crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+        
+        if face_crop.size == 0:
+            return None
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+        
+        # Resize to 224x224, then crop center 112x112 (TalkNet format)
+        resized = cv2.resize(gray, (224, 224))
+        center_crop = resized[56:168, 56:168]
+        
+        return center_crop
+        
+    except Exception as e:
+        return None
+
+
+def run_talknet_inference(audio_array, video_frames):
+    """
+    Run TalkNet neural network inference on audio-video pair.
     
     Args:
-        face_sequence: List of (mouth_region, frame_idx) tuples
-        mfcc_features: MFCC audio features array
+        audio_array: Audio array (16kHz)
+        video_frames: Video frames array (N, 112, 112)
         
     Returns:
-        Speaking score (0-1), higher = more likely speaking
+        Speaking score (positive = speaking, negative = not speaking)
     """
-    if len(face_sequence) < 3 or mfcc_features is None or len(mfcc_features) < 10:
+    if not TALKNET_AVAILABLE or TALKNET_MODEL is None:
         return 0.0
     
     try:
-        # Calculate lip movement variance over time
-        movements = []
-        for i in range(1, len(face_sequence)):
-            prev_mouth = face_sequence[i - 1][0]
-            curr_mouth = face_sequence[i][0]
-            
-            if prev_mouth is None or curr_mouth is None:
-                continue
-            
-            # Calculate frame difference
-            diff = cv2.absdiff(prev_mouth, curr_mouth)
-            movement = np.mean(diff)
-            movements.append(movement)
+        import torch
+        import python_speech_features
         
-        if len(movements) < 2:
+        # Extract MFCC features (100 frames per second)
+        mfcc = python_speech_features.mfcc(audio_array, 16000, numcep=13, winlen=0.025, winstep=0.010)
+        
+        # Calculate length (TalkNet uses 4:1 audio:video ratio per second)
+        length = min((mfcc.shape[0] - mfcc.shape[0] % 4) / 100, video_frames.shape[0] / 25)
+        
+        if length < 0.1:
             return 0.0
         
-        # Speaking produces rhythmic, variable lip movement
-        movement_variance = np.var(movements)
-        movement_mean = np.mean(movements)
+        # Trim to aligned length
+        audio_frames = int(round(length * 100))
+        video_frame_count = int(round(length * 25))
         
-        # Audio energy over time (from MFCC)
-        audio_energy = np.sum(mfcc_features ** 2, axis=1)
-        audio_variance = np.var(audio_energy)
-        audio_mean = np.mean(audio_energy)
+        mfcc = mfcc[:audio_frames, :]
+        video_frames = video_frames[:video_frame_count, :, :]
         
-        # Correlate lip movement with audio energy
-        # Resample to match lengths
-        num_points = min(len(movements), len(audio_energy))
-        if num_points < 3:
-            return 0.0
+        # Convert to tensors
+        inputA = torch.FloatTensor(mfcc).unsqueeze(0).to(TALKNET_DEVICE)
+        inputV = torch.FloatTensor(video_frames).unsqueeze(0).to(TALKNET_DEVICE)
         
-        # Simple correlation: speaking = high audio + high lip movement
-        lip_score = min(1.0, movement_mean / 15.0)  # Normalize
-        audio_score = min(1.0, audio_mean / 50.0)   # Normalize
+        # Run inference
+        with torch.no_grad():
+            scores = TALKNET_MODEL(inputA, inputV)
         
-        # Combined score with audio-visual agreement bonus
-        if lip_score > 0.3 and audio_score > 0.3:
-            # Both modalities agree - likely speaking
-            combined_score = (lip_score + audio_score) / 2 + 0.2
-        else:
-            combined_score = (lip_score + audio_score) / 2
-        
-        return min(1.0, combined_score)
+        return float(np.mean(scores))
         
     except Exception as e:
         return 0.0
+
+
+def detect_speakers_fast(video_path, scene_start_frame, scene_end_frame, 
+                         people_detections, fps, segment_duration=2.0):
+    """
+    FAST speaker detection - extracts audio/video ONCE, processes all at once.
+    ~10x faster than per-segment extraction.
+    
+    Based on optimization from: https://www.sievedata.com/blog/fast-active-speaker-detection
+    
+    Returns:
+        List of segment dicts with speaker_idx and score
+    """
+    people_with_faces = [(i, p) for i, p in enumerate(people_detections) 
+                        if p.get('face_box') is not None]
+    
+    if len(people_with_faces) == 0:
+        return []
+    
+    scene_start_time = scene_start_frame / fps
+    scene_duration = (scene_end_frame - scene_start_frame) / fps
+    
+    # === STEP 1: Extract audio ONCE for entire scene ===
+    full_audio = extract_scene_audio(video_path, scene_start_time, scene_duration)
+    if full_audio is None:
+        return []
+    
+    # Check if there's any significant audio
+    audio_energy = np.sqrt(np.mean(full_audio ** 2))
+    if audio_energy < 100:
+        return []
+    
+    # === STEP 2: Extract ALL frames ONCE and cache them ===
+    cached_frames = extract_scene_frames_cached(video_path, scene_start_frame, scene_end_frame, fps)
+    if len(cached_frames) < 5:
+        return []
+    
+    # === STEP 3: Extract face crops for ALL people from cached frames ===
+    # Structure: {person_idx: [(frame_num, face_crop), ...]}
+    all_face_crops = {i: [] for i, _ in people_with_faces}
+    
+    for frame_num, frame in cached_frames:
+        for person_idx, person in people_with_faces:
+            face_box = person['face_box']
+            face_crop = extract_face_crop_from_frame(frame, face_box)
+            if face_crop is not None:
+                all_face_crops[person_idx].append((frame_num, face_crop))
+    
+    # === STEP 4: Segment analysis using cached data ===
+    segment_frames = int(segment_duration * fps)
+    segments = []
+    current_frame = scene_start_frame
+    
+    # Audio samples per frame (16kHz audio, video at fps)
+    audio_samples_per_frame = 16000 / fps
+    
+    while current_frame < scene_end_frame:
+        segment_end = min(current_frame + segment_frames, scene_end_frame)
+        
+        # Get audio slice for this segment
+        audio_start_sample = int((current_frame - scene_start_frame) * audio_samples_per_frame)
+        audio_end_sample = int((segment_end - scene_start_frame) * audio_samples_per_frame)
+        segment_audio = full_audio[audio_start_sample:audio_end_sample]
+        
+        if len(segment_audio) < 1600:  # Less than 0.1s of audio
+            current_frame = segment_end
+            continue
+        
+        # Get face crops for this segment from cache
+        segment_scores = {}
+        
+        for person_idx, face_data in all_face_crops.items():
+            # Filter face crops for this segment
+            segment_crops = [crop for frame_num, crop in face_data 
+                           if current_frame <= frame_num < segment_end]
+            
+            if len(segment_crops) < 3:
+                segment_scores[person_idx] = -1.0
+                continue
+            
+            video_frames = np.array(segment_crops)
+            
+            # Run TalkNet inference
+            if TALKNET_AVAILABLE and TALKNET_MODEL is not None:
+                score = run_talknet_inference(segment_audio, video_frames)
+            else:
+                # Fallback: lip movement score
+                score = calculate_lip_movement(segment_crops)
+            
+            segment_scores[person_idx] = score
+        
+        # Determine speaker for this segment
+        if segment_scores:
+            best_idx = max(segment_scores, key=segment_scores.get)
+            best_score = segment_scores[best_idx]
+            speaker_idx = best_idx if best_score > 0 else None
+        else:
+            speaker_idx = None
+            best_score = 0.0
+        
+        segments.append({
+            'start_frame': current_frame,
+            'end_frame': segment_end,
+            'speaker_idx': speaker_idx,
+            'score': best_score
+        })
+        
+        current_frame = segment_end
+    
+    return segments
+
+
+def detect_conversation_mode(speaker_segments, people_detections):
+    """
+    Analyze speaker segments to find who speaks the most.
+    
+    Instead of using split-screen for conversations, we now focus on
+    the person who speaks the most in the sequence.
+    
+    Args:
+        speaker_segments: List of segment dictionaries with speaker info
+        people_detections: List of detected people
+        
+    Returns:
+        Tuple of (is_conversation, dominant_speaker_idx)
+        - is_conversation: Always False now (we focus on dominant speaker)
+        - dominant_speaker_idx: Index of person who speaks the most, or None
+    """
+    if len(speaker_segments) < 1:
+        return False, None
+    
+    # Count speaking time per person
+    speaker_times = {}
+    
+    for seg in speaker_segments:
+        idx = seg['speaker_idx']
+        if idx is not None and seg['score'] > 0:
+            duration = seg['end_frame'] - seg['start_frame']
+            speaker_times[idx] = speaker_times.get(idx, 0) + duration
+    
+    if not speaker_times:
+        return False, None
+    
+    # Find who speaks the most
+    dominant_speaker = max(speaker_times, key=speaker_times.get)
+    total_speaking = sum(speaker_times.values())
+    
+    if total_speaking > 0:
+        dominant_ratio = speaker_times[dominant_speaker] / total_speaking
+        print(f"  🎤 Speaker analysis: Person {dominant_speaker + 1} speaks {dominant_ratio*100:.0f}% of the time")
+    
+    # Always return the dominant speaker (no split-screen)
+    return False, dominant_speaker
 
 
 def detect_active_speaker_talknet(video_path, scene_start_frame, scene_end_frame, 
                                    people_detections, fps):
     """
-    Detect active speaker using audio-visual analysis.
-    Analyzes lip movement correlated with audio features.
+    FAST TalkNet-based active speaker detection.
     
-    Based on TalkNet approach: https://github.com/TaoRuijie/TalkNet-ASD
+    Optimized to extract audio/video ONCE per scene (not per segment).
+    Always focuses on the person who speaks the most.
     
     Returns:
-        Index of the active speaker in people_detections, or None if undetermined
+        Tuple of (speaker_index, is_conversation, speaker_segments)
+        - speaker_index: Person who speaks the most
+        - is_conversation: Always False (we always focus on dominant speaker)
+        - speaker_segments: Per-segment data for debugging
     """
-    if not TALKNET_AVAILABLE:
-        return None
-    
-    # Filter people with faces
     people_with_faces = [(i, p) for i, p in enumerate(people_detections) 
                         if p.get('face_box') is not None]
     
     if len(people_with_faces) == 0:
-        return None
+        return None, False, []
+    
+    if len(people_with_faces) == 1:
+        # Single person - return them as speaker
+        return people_with_faces[0][0], False, []
     
     try:
-        # Extract audio features for the scene
-        mfcc_features = extract_audio_features(video_path, scene_start_frame, scene_end_frame, fps)
+        scene_duration = (scene_end_frame - scene_start_frame) / fps
         
-        if mfcc_features is None:
-            return None  # No audio - can't determine speaker
+        # Use shorter segments for better speaker detection
+        segment_duration = min(2.0, scene_duration / 3)
+        segment_duration = max(1.0, segment_duration)
         
-        # Check if there's any significant audio
-        audio_energy = np.mean(np.sum(mfcc_features ** 2, axis=1))
-        if audio_energy < 10:  # Very quiet - no one speaking
-            return None
+        # Use FAST detection (extracts audio/video once)
+        speaker_segments = detect_speakers_fast(
+            video_path, scene_start_frame, scene_end_frame,
+            people_detections, fps, segment_duration
+        )
         
-        # Open video and sample frames
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            return None
+        if not speaker_segments:
+            return None, False, []
         
-        scene_duration = scene_end_frame - scene_start_frame
-        num_samples = min(30, max(10, scene_duration // 2))
-        sample_frames = np.linspace(scene_start_frame, scene_end_frame - 1, num_samples, dtype=int)
+        # Find the person who speaks the most
+        _, dominant_speaker = detect_conversation_mode(
+            speaker_segments, people_detections
+        )
         
-        # Collect mouth regions for each person
-        mouth_sequences = {i: [] for i, _ in people_with_faces}
+        if dominant_speaker is not None:
+            return dominant_speaker, False, speaker_segments
         
-        for frame_idx, frame_num in enumerate(sample_frames):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-            ret, frame = cap.read()
-            
-            if not ret:
-                continue
-            
-            for person_idx, person in people_with_faces:
-                face_box = person['face_box']
-                mouth_region = get_mouth_region(face_box, frame)
-                mouth_sequences[person_idx].append((mouth_region, frame_idx))
-        
-        cap.release()
-        
-        # Compute speaking score for each person
-        speaking_scores = {}
-        
-        for person_idx, mouth_seq in mouth_sequences.items():
-            score = compute_speaking_score(mouth_seq, mfcc_features)
-            speaking_scores[person_idx] = score
-        
-        if not speaking_scores:
-            return None
-        
-        # Find the highest scoring person
-        best_speaker = max(speaking_scores, key=speaking_scores.get)
-        best_score = speaking_scores[best_speaker]
-        
-        # Only return if score is significant
-        if best_score < 0.4:
-            return None
-        
-        # For single person, return them if they're speaking
-        if len(people_with_faces) == 1:
-            return best_speaker if best_score > 0.4 else None
-        
-        # For multiple people, require clear winner
-        other_scores = [s for i, s in speaking_scores.items() if i != best_speaker]
-        if other_scores:
-            max_other = max(other_scores)
-            # Need to be significantly higher than others
-            if best_score < max_other * 1.5:
-                return None
-        
-        return best_speaker
+        return None, False, speaker_segments
         
     except Exception as e:
         print(f"  ⚠️  Speaker detection failed: {e}")
-        return None
+        import traceback
+        traceback.print_exc()
+        return None, False, []
+
+
+def compute_speaking_score_fallback(face_sequence, audio_energy_segments):
+    """
+    Fallback speaking score computation using lip movement + audio correlation.
+    Used when TalkNet is not available.
+    
+    Args:
+        face_sequence: List of (mouth_region, frame_num) tuples
+        audio_energy_segments: Dict mapping frame numbers to audio energy
+        
+    Returns:
+        Speaking score (higher = more likely speaking)
+    """
+    if len(face_sequence) < 3:
+        return 0.0
+    
+    try:
+        # Calculate movement during audio vs silence
+        audio_movement = 0.0
+        silent_movement = 0.0
+        audio_frames = 0
+        silent_frames = 0
+        
+        for i in range(1, len(face_sequence)):
+            prev_mouth, prev_frame = face_sequence[i - 1]
+            curr_mouth, curr_frame = face_sequence[i]
+            
+            if prev_mouth is None or curr_mouth is None:
+                continue
+            
+            diff = cv2.absdiff(prev_mouth, curr_mouth)
+            movement = np.mean(diff)
+            
+            # Get audio energy for this frame
+            avg_energy = (audio_energy_segments.get(prev_frame, 0) + 
+                         audio_energy_segments.get(curr_frame, 0)) / 2
+            
+            if avg_energy > 0.1:
+                audio_movement += movement
+                audio_frames += 1
+            else:
+                silent_movement += movement
+                silent_frames += 1
+        
+        # Speaker should move more during audio than silence
+        if audio_frames > 0 and silent_frames > 0:
+            audio_avg = audio_movement / audio_frames
+            silent_avg = silent_movement / silent_frames
+            # Positive score if moving more during audio
+            return audio_avg - silent_avg
+        elif audio_frames > 0:
+            return audio_movement / audio_frames
+        else:
+            return 0.0
+        
+    except Exception as e:
+        return 0.0
 
 
 def detect_active_speaker(video_path, scene_start_frame, scene_end_frame, people_detections, 
@@ -496,8 +1053,7 @@ def detect_active_speaker(video_path, scene_start_frame, scene_end_frame, people
     Detect who is the active speaker in a scene.
     Uses TalkNet (audio-visual) if available, otherwise falls back to lip movement analysis.
     
-    The fallback is CONSERVATIVE - only identifies a speaker when very confident,
-    otherwise returns None to allow split-screen or group tracking.
+    Always focuses on the person who speaks the MOST (no split-screen).
     
     Args:
         video_path: Path to video
@@ -510,58 +1066,51 @@ def detect_active_speaker(video_path, scene_start_frame, scene_end_frame, people
         sample_interval: Sample every N frames for lip analysis
         
     Returns:
-        Index of the active speaker in people_detections, or None if undetermined
+        Tuple of (speaker_index, is_conversation, speaker_segments)
+        - speaker_index: Index of person who speaks the most
+        - is_conversation: Always False (we focus on dominant speaker)
+        - speaker_segments: Per-segment speaker data for debugging
     """
     if not people_detections:
-        return None
+        return None, False, []
     
     # Filter people who have face detections
     people_with_faces = [(i, p) for i, p in enumerate(people_detections) if p.get('face_box') is not None]
     
     if len(people_with_faces) == 0:
-        return None
+        return None, False, []
     
-    # IMPORTANT: Don't assume single face = speaker
-    # They might just be listening! Only return speaker if we can confirm they're talking.
+    # Single person - return them as speaker
     if len(people_with_faces) == 1:
-        # With only one face, we can't compare - check if they're actually speaking
-        # by correlating with audio
-        audio_segments = extract_audio_activity(video_path, fps, scene_end_frame, chunk_duration=0.3)
-        if audio_segments:
-            # There's audio activity - check if this person's lips are moving during speech
-            total_energy = sum(s[2] for s in audio_segments)
-            if total_energy > 0.5:  # Significant audio
-                # Single person with significant audio - likely the speaker
-                return people_with_faces[0][0]
-        # No clear audio or no correlation - don't assume they're speaking
-        return None
+        return people_with_faces[0][0], False, []
     
     # Try TalkNet first (most accurate)
     if TALKNET_AVAILABLE:
-        talknet_result = detect_active_speaker_talknet(
+        speaker_idx, _, segments = detect_active_speaker_talknet(
             video_path, scene_start_frame, scene_end_frame, people_detections, fps
         )
-        if talknet_result is not None:
-            return talknet_result
+        
+        if speaker_idx is not None:
+            return speaker_idx, False, segments
     
     # Fallback: Lip movement analysis with audio correlation
-    # Extract audio activity first
     audio_segments = extract_audio_activity(video_path, fps, scene_end_frame, chunk_duration=0.3)
     
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return None
+        return None, False, []
     
-    # Collect mouth regions for each person across the scene
+    # Collect mouth regions for each person
     mouth_sequences = {i: [] for i, _ in people_with_faces}
-    frame_audio_energy = {}  # Map frame to audio energy
+    frame_audio_energy = {}
     
     scene_duration = scene_end_frame - scene_start_frame
-    num_samples = min(25, scene_duration // sample_interval)  # More samples for accuracy
+    num_samples = min(25, scene_duration // sample_interval)
     
-    if num_samples < 5:  # Need enough samples for reliable detection
+    if num_samples < 5:
         cap.release()
-        return None
+        # Return first person as fallback
+        return people_with_faces[0][0], False, []
     
     sample_frames = np.linspace(scene_start_frame, scene_end_frame - 1, num_samples, dtype=int)
     
@@ -581,95 +1130,30 @@ def detect_active_speaker(video_path, scene_start_frame, scene_end_frame, people
         for person_idx, person in people_with_faces:
             face_box = person['face_box']
             mouth_region = get_mouth_region(face_box, frame)
-            
-            # Store with audio energy for this frame
-            audio_energy = frame_audio_energy.get(frame_num, 0.0)
-            mouth_sequences[person_idx].append((mouth_region, audio_energy))
+            mouth_sequences[person_idx].append((mouth_region, frame_num))
     
     cap.release()
     
-    # Calculate lip movement correlated with audio
+    # Calculate movement scores using fallback method
     movement_scores = {}
-    audio_correlated_scores = {}
-    
     for person_idx, mouth_data in mouth_sequences.items():
-        valid_regions = [(m, e) for m, e in mouth_data if m is not None]
-        if len(valid_regions) < 5:
-            movement_scores[person_idx] = 0.0
-            audio_correlated_scores[person_idx] = 0.0
-            continue
-        
-        # Calculate movement only during audio activity
-        audio_movement = 0.0
-        silent_movement = 0.0
-        audio_frames = 0
-        silent_frames = 0
-        
-        for i in range(1, len(valid_regions)):
-            prev_mouth, prev_energy = valid_regions[i - 1]
-            curr_mouth, curr_energy = valid_regions[i]
-            
-            diff = cv2.absdiff(prev_mouth, curr_mouth)
-            movement = np.mean(diff)
-            
-            # Separate movement during audio vs silence
-            avg_energy = (prev_energy + curr_energy) / 2
-            if avg_energy > 0.1:  # Audio active
-                audio_movement += movement
-                audio_frames += 1
-            else:
-                silent_movement += movement
-                silent_frames += 1
-        
-        movement_scores[person_idx] = (audio_movement + silent_movement) / max(1, len(valid_regions) - 1)
-        
-        # Audio-correlated score: movement during speech vs movement during silence
-        if audio_frames > 0 and silent_frames > 0:
-            avg_audio_movement = audio_movement / audio_frames
-            avg_silent_movement = silent_movement / silent_frames
-            # Speaker should move more during audio than during silence
-            audio_correlated_scores[person_idx] = avg_audio_movement - avg_silent_movement
-        elif audio_frames > 0:
-            audio_correlated_scores[person_idx] = audio_movement / audio_frames
-        else:
-            audio_correlated_scores[person_idx] = 0.0
+        score = compute_speaking_score_fallback(mouth_data, frame_audio_energy)
+        movement_scores[person_idx] = score
     
     if not movement_scores:
-        return None
+        return people_with_faces[0][0], False, []
     
-    # Use audio-correlated score if available, otherwise raw movement
-    if any(s > 0 for s in audio_correlated_scores.values()):
-        scores = audio_correlated_scores
-        threshold = 3.0  # Higher threshold for correlated scores
-        ratio_threshold = 2.0  # Need 2x more correlated movement
-    else:
-        scores = movement_scores
-        threshold = 8.0  # Higher threshold for raw movement (more conservative)
-        ratio_threshold = 2.5  # Need 2.5x more movement
+    # Find the person who speaks the MOST (highest score)
+    speaker_idx = max(movement_scores, key=movement_scores.get)
+    max_score = movement_scores[speaker_idx]
     
-    max_score = max(scores.values())
+    # Log the analysis
+    total_score = sum(movement_scores.values())
+    if total_score > 0:
+        ratio = max_score / total_score * 100
+        print(f"  🎤 Fallback: Person {speaker_idx + 1} speaks {ratio:.0f}% (score: {max_score:.1f})")
     
-    if max_score < threshold:
-        # No one is clearly speaking
-        return None
-    
-    # Find best candidate
-    speaker_idx = max(scores, key=scores.get)
-    other_scores = [v for k, v in scores.items() if k != speaker_idx]
-    
-    if other_scores:
-        # Require CLEAR winner - much more conservative than before
-        max_other = max(other_scores)
-        if max_other > 0:
-            if scores[speaker_idx] / max_other < ratio_threshold:
-                # Not enough difference - can't determine speaker
-                return None
-        
-        avg_other = sum(other_scores) / len(other_scores)
-        if avg_other > 0 and scores[speaker_idx] < avg_other * ratio_threshold:
-            return None
-    
-    return speaker_idx
+    return speaker_idx, False, []
 
 
 def analyze_scene_with_speaker_detection(video_path, scene_start_time, scene_end_time, model, 
@@ -677,9 +1161,10 @@ def analyze_scene_with_speaker_detection(video_path, scene_start_time, scene_end
                                           confidence_threshold, num_sample_frames, fps):
     """
     Analyze scene content and detect the active speaker.
+    Now also detects conversation mode.
     
     Returns:
-        Tuple of (detections_list, active_speaker_index)
+        Tuple of (detections_list, active_speaker_index, is_conversation, speaker_segments)
     """
     # First, get the regular detections
     detections = analyze_scene_content(
@@ -689,18 +1174,18 @@ def analyze_scene_with_speaker_detection(video_path, scene_start_time, scene_end
     
     if len(detections) <= 1:
         # Single person or no one - no need for speaker detection
-        return detections, 0 if detections else None
+        return detections, 0 if detections else None, False, []
     
-    # Detect active speaker
+    # Detect active speaker (now returns conversation info too)
     start_frame = scene_start_time.get_frames()
     end_frame = scene_end_time.get_frames()
     
-    active_speaker = detect_active_speaker(
+    active_speaker, is_conversation, segments = detect_active_speaker(
         video_path, start_frame, end_frame, detections,
         dnn_face_detector, face_cascade, fps
     )
     
-    return detections, active_speaker
+    return detections, active_speaker, is_conversation, segments
 
 
 def load_dnn_face_detector():
@@ -739,21 +1224,27 @@ def load_dnn_face_detector():
         print("   Falling back to Haar Cascade (no confidence scores)")
         return None
 
-def compute_saliency_region(frame, aspect_ratio, padding_factor=1.5):
+def compute_saliency_region(frame, aspect_ratio, padding_factor=1.5, max_zoom=2.5):
     """
     Compute the most salient (visually interesting) region in a frame.
-    Uses OpenCV's Spectral Residual saliency detection.
+    Uses OpenCV's Spectral Residual saliency detection if available.
+    Returns None if saliency isn't confident enough or would require too much zoom.
     
     Args:
         frame: Input frame (BGR)
         aspect_ratio: Target aspect ratio (width/height)
         padding_factor: How much padding around salient region (1.5 = 50% padding)
+        max_zoom: Maximum zoom factor allowed (default 2.5x)
         
     Returns:
-        Bounding box [x1, y1, x2, y2] of the most salient region, or None if failed
+        Bounding box [x1, y1, x2, y2] of the most salient region, or None if not confident
     """
     try:
         frame_height, frame_width = frame.shape[:2]
+        
+        # Check if saliency module is available (requires opencv-contrib-python)
+        if not hasattr(cv2, 'saliency'):
+            return None
         
         # Create saliency detector
         saliency = cv2.saliency.StaticSaliencySpectralResidual_create()
@@ -770,6 +1261,11 @@ def compute_saliency_region(frame, aspect_ratio, padding_factor=1.5):
         # Apply Gaussian blur to smooth the map
         saliency_map = cv2.GaussianBlur(saliency_map, (25, 25), 0)
         
+        # Check saliency confidence - if max saliency is low, not confident
+        max_saliency = np.max(saliency_map)
+        if max_saliency < 50:  # Low contrast saliency map = not confident
+            return None
+        
         # Threshold to find salient regions (top 20% most salient)
         threshold = np.percentile(saliency_map, 80)
         _, binary_map = cv2.threshold(saliency_map, threshold, 255, cv2.THRESH_BINARY)
@@ -778,29 +1274,17 @@ def compute_saliency_region(frame, aspect_ratio, padding_factor=1.5):
         contours, _ = cv2.findContours(binary_map, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         if not contours:
-            # No distinct salient region - use center of mass of saliency
-            moments = cv2.moments(saliency_map)
-            if moments['m00'] > 0:
-                cx = int(moments['m10'] / moments['m00'])
-                cy = int(moments['m01'] / moments['m00'])
-            else:
-                # Fallback to center
-                cx, cy = frame_width // 2, frame_height // 2
-            
-            # Create a region around center of mass
-            region_height = frame_height // 3
-            region_width = int(region_height * aspect_ratio)
-            
-            x1 = max(0, cx - region_width // 2)
-            y1 = max(0, cy - region_height // 2)
-            x2 = min(frame_width, x1 + region_width)
-            y2 = min(frame_height, y1 + region_height)
-            
-            return [x1, y1, x2, y2]
+            # No distinct salient region found
+            return None
         
         # Get bounding box of all salient contours combined
         all_points = np.vstack(contours)
         x, y, w, h = cv2.boundingRect(all_points)
+        
+        # Check if salient region is too small (would require excessive zoom)
+        salient_area_ratio = (w * h) / (frame_width * frame_height)
+        if salient_area_ratio < 0.05:  # Less than 5% of frame = too small
+            return None
         
         # Add padding around the salient region
         center_x = x + w // 2
@@ -809,19 +1293,27 @@ def compute_saliency_region(frame, aspect_ratio, padding_factor=1.5):
         padded_w = int(w * padding_factor)
         padded_h = int(h * padding_factor)
         
-        # Ensure minimum size (at least 30% of frame)
-        padded_w = max(padded_w, int(frame_width * 0.3))
-        padded_h = max(padded_h, int(frame_height * 0.3))
+        # Ensure minimum size (at least 40% of frame to avoid excessive zoom)
+        min_size = 1.0 / max_zoom  # e.g., max_zoom=2.5 means min 40% of frame
+        padded_w = max(padded_w, int(frame_width * min_size))
+        padded_h = max(padded_h, int(frame_height * min_size))
         
         x1 = max(0, center_x - padded_w // 2)
         y1 = max(0, center_y - padded_h // 2)
         x2 = min(frame_width, center_x + padded_w // 2)
         y2 = min(frame_height, center_y + padded_h // 2)
         
+        # Final check: would this crop require too much zoom?
+        crop_width = x2 - x1
+        crop_height = y2 - y1
+        zoom_factor = max(frame_width / crop_width, frame_height / crop_height)
+        
+        if zoom_factor > max_zoom:
+            return None
+        
         return [x1, y1, x2, y2]
         
     except Exception as e:
-        print(f"  ⚠️  Saliency detection failed: {e}")
         return None
 
 
@@ -899,9 +1391,12 @@ def detect_face_dnn(frame, face_net, person_box=None, min_confidence=0.5):
     return faces
 
 
-def analyze_single_frame(frame, model, face_cascade, dnn_face_detector, analysis_scale, confidence_threshold):
+def analyze_single_frame(frame, model, face_cascade, dnn_face_detector, analysis_scale, confidence_threshold, min_face_confidence=0.6):
     """
     Analyze a single frame for people and faces.
+    
+    Args:
+        min_face_confidence: Minimum confidence to consider a face valid (default 0.6)
     
     Returns:
         List of detected objects with person_box, face_box, confidence, face_confidence
@@ -956,15 +1451,21 @@ def analyze_single_frame(frame, model, face_cascade, dnn_face_detector, analysis
                     faces = detect_face_dnn(frame, dnn_face_detector, person_box, min_confidence=0.5)
                     if faces:
                         faces.sort(key=lambda x: x[1], reverse=True)
-                        face_box, face_confidence = faces[0]
+                        detected_face_box, detected_face_conf = faces[0]
+                        # Only accept face if confidence is high enough
+                        if detected_face_conf >= min_face_confidence:
+                            face_box = detected_face_box
+                            face_confidence = detected_face_conf
                 else:
                     person_roi_gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
                     faces = face_cascade.detectMultiScale(person_roi_gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
                     
                     if len(faces) > 0:
                         fx, fy, fw, fh = faces[0]
-                        face_box = [x1 + fx, y1 + fy, x1 + fx + fw, y1 + fy + fh]
-                        face_confidence = 0.8
+                        # Haar cascade doesn't give confidence, assume 0.7
+                        if 0.7 >= min_face_confidence:
+                            face_box = [x1 + fx, y1 + fy, x1 + fx + fw, y1 + fy + fh]
+                            face_confidence = 0.7
 
                 detected_objects.append({
                     'person_box': person_box, 
@@ -976,8 +1477,11 @@ def analyze_single_frame(frame, model, face_cascade, dnn_face_detector, analysis
     # Fallback: face detection if no people found
     if len(detected_objects) == 0:
         if dnn_face_detector is not None:
-            faces = detect_face_dnn(frame, dnn_face_detector, min_confidence=0.4)
+            # Use stricter confidence for fallback face detection
+            faces = detect_face_dnn(frame, dnn_face_detector, min_confidence=min_face_confidence)
             for face_box, face_conf in faces:
+                if face_conf < min_face_confidence:
+                    continue
                 fx1, fy1, fx2, fy2 = face_box
                 fw, fh = fx2 - fx1, fy2 - fy1
                 estimated_body_height = fh * 5
@@ -995,25 +1499,27 @@ def analyze_single_frame(frame, model, face_cascade, dnn_face_detector, analysis
                     'face_confidence': face_conf
                 })
         else:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
-            
-            for (x, y, w, h) in faces:
-                face_box = [x, y, x + w, y + h]
-                estimated_body_height = h * 5
-                padding_x = int(w * 0.8)
-                person_box = [
-                    max(0, x - padding_x),
-                    max(0, y - int(h * 0.3)),
-                    min(frame_width, x + w + padding_x),
-                    min(frame_height, y + estimated_body_height)
-                ]
-                detected_objects.append({
-                    'person_box': person_box, 
-                    'face_box': face_box,
-                    'confidence': 0.4,
-                    'face_confidence': 0.7
-                })
+            # Haar cascade fallback - only use if min_face_confidence allows
+            if min_face_confidence <= 0.7:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
+                
+                for (x, y, w, h) in faces:
+                    face_box = [x, y, x + w, y + h]
+                    estimated_body_height = h * 5
+                    padding_x = int(w * 0.8)
+                    person_box = [
+                        max(0, x - padding_x),
+                        max(0, y - int(h * 0.3)),
+                        min(frame_width, x + w + padding_x),
+                        min(frame_height, y + estimated_body_height)
+                    ]
+                    detected_objects.append({
+                        'person_box': person_box, 
+                        'face_box': face_box,
+                        'confidence': 0.4,
+                        'face_confidence': 0.7
+                    })
     
     return detected_objects
 
@@ -1131,7 +1637,7 @@ def merge_detections_across_frames(all_frame_detections, iou_threshold=0.5):
 def compute_scene_fallback(video_path, scene_start_time, scene_end_time, aspect_ratio, fallback_strategy='saliency'):
     """
     Compute a fallback crop region for scenes without people.
-    Uses saliency detection or center crop.
+    Uses saliency detection if confident, otherwise letterbox.
     
     Args:
         video_path: Path to video
@@ -1165,16 +1671,19 @@ def compute_scene_fallback(video_path, scene_start_time, scene_end_time, aspect_
     frame_height, frame_width = frame.shape[:2]
     
     if fallback_strategy == 'saliency':
-        # Try saliency detection
+        # Try saliency detection - returns None if not confident or requires too much zoom
         saliency_box = compute_saliency_region(frame, aspect_ratio)
         if saliency_box:
             print(f"  🎯 Using saliency detection (no people found)")
             return saliency_box
-        # Fall through to center if saliency fails
+        # Saliency not confident - use letterbox
+        return None
     
-    # Center crop fallback
-    print(f"  📍 Using center crop (no people found)")
-    return get_center_crop_box(frame_width, frame_height, aspect_ratio)
+    if fallback_strategy == 'center':
+        print(f"  📍 Using center crop (no people found)")
+        return get_center_crop_box(frame_width, frame_height, aspect_ratio)
+    
+    return None
 
 
 def analyze_scene_content(video_path, scene_start_time, scene_end_time, model, face_cascade, analysis_scale=1.0, dnn_face_detector=None, confidence_threshold=0.3, num_sample_frames=3):
@@ -1361,8 +1870,9 @@ def are_people_too_close_for_split(person1, person2, frame_width, frame_height, 
     """
     Check if two people are too close together for split-screen to work well.
     If their crops would overlap significantly, split-screen won't look good.
+    Also checks if both people are centered (crops would be too similar).
     
-    Returns True if people are too close (should track one instead of split)
+    Returns True if split-screen would look bad (should track one instead)
     """
     box1 = person1['person_box']
     box2 = person2['person_box']
@@ -1408,6 +1918,28 @@ def are_people_too_close_for_split(person1, person2, frame_width, frame_height, 
         crop_overlap_ratio = overlap_width / smaller_crop_width if smaller_crop_width > 0 else 0
         
         if crop_overlap_ratio > 0.5:  # More than 50% crop overlap
+            return True
+    
+    # NEW: Check if both crops would show similar content (both people near center)
+    # If both people are centered horizontally, both crops would look almost identical
+    frame_center_x = frame_width / 2
+    dist1_from_center = abs(center1_x - frame_center_x) / frame_width
+    dist2_from_center = abs(center2_x - frame_center_x) / frame_width
+    
+    # If both people are within 20% of center, crops would be too similar
+    if dist1_from_center < 0.20 and dist2_from_center < 0.20:
+        print(f"  ⚠️  Both people too centered, crops would be similar")
+        return True
+    
+    # Check if people are on same side of frame (crops would show same background)
+    same_side = (center1_x < frame_center_x and center2_x < frame_center_x) or \
+                (center1_x > frame_center_x and center2_x > frame_center_x)
+    
+    # If both on same side AND close together, crops would be too similar
+    if same_side:
+        horizontal_distance = abs(center1_x - center2_x) / frame_width
+        if horizontal_distance < 0.25:  # Less than 25% of frame apart
+            print(f"  ⚠️  People on same side and close, crops would be similar")
             return True
     
     return False
@@ -2135,7 +2667,7 @@ def get_video_codec(video_path):
         return None
 
 
-def process_video(input_video, final_output_video, model, face_cascade, aspect_ratio=9/16, analysis_scale=1.0, use_gpu=False, confidence_threshold=0.3, use_dnn_face=True, num_sample_frames=3, detect_speaker=True, fallback_strategy='saliency', tracking_mode='smooth', tracking_smoothness=0.08, verbose=False):
+def process_video(input_video, final_output_video, model, face_cascade, aspect_ratio=9/16, analysis_scale=1.0, use_gpu=False, confidence_threshold=0.3, use_dnn_face=True, num_sample_frames=3, detect_speaker=False, fallback_strategy='saliency', tracking_mode='smooth', tracking_smoothness=0.08, verbose=False):
     """
     Main video processing function that converts horizontal video to vertical format.
     OpusClip-like quality with smooth tracking and real-time subject following.
@@ -2226,8 +2758,10 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
         
         # Detect active speaker if enabled and multiple people
         active_speaker_idx = None
+        speaker_segments = []
+        
         if detect_speaker and len(analysis) > 1:
-            active_speaker_idx = detect_active_speaker(
+            active_speaker_idx, _, speaker_segments = detect_active_speaker(
                 input_video, 
                 start_time.get_frames(), 
                 end_time.get_frames(),
@@ -2239,30 +2773,22 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
             if active_speaker_idx is not None:
                 speakers_detected += 1
         
+        # Always focus on speaker (no split-screen)
         strategy, target_box = decide_cropping_strategy(
             analysis, original_height, original_width, aspect_ratio,
             active_speaker_idx=active_speaker_idx
         )
         
-        # If no people detected (LETTERBOX), ALWAYS try fallback strategy
-        # This ensures we almost never have letterbox unless explicitly requested
-        if strategy == 'LETTERBOX':
-            if fallback_strategy != 'letterbox':
-                fallback_box = compute_scene_fallback(
-                    input_video, start_time, end_time, aspect_ratio, fallback_strategy
-                )
-                if fallback_box:
-                    strategy = 'TRACK'
-                    target_box = fallback_box
-                else:
-                    # Even if saliency fails, use center crop
-                    print(f"  📍 Saliency failed, using center crop")
-                    fallback_box = compute_scene_fallback(
-                        input_video, start_time, end_time, aspect_ratio, 'center'
-                    )
-                    if fallback_box:
-                        strategy = 'TRACK'
-                        target_box = fallback_box
+        # If no people detected (LETTERBOX), try saliency if confident
+        # Otherwise just use letterbox - it's fine for landscapes, B-roll, etc.
+        if strategy == 'LETTERBOX' and fallback_strategy == 'saliency':
+            fallback_box = compute_scene_fallback(
+                input_video, start_time, end_time, aspect_ratio, fallback_strategy
+            )
+            if fallback_box:
+                strategy = 'TRACK'
+                target_box = fallback_box
+            # If saliency not confident, keep LETTERBOX - that's okay
         
         scenes_analysis.append({
             'start_frame': start_time.get_frames(),
@@ -2270,11 +2796,12 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
             'analysis': analysis,
             'strategy': strategy,
             'target_box': target_box,
-            'active_speaker': active_speaker_idx
+            'active_speaker': active_speaker_idx,
+            'speaker_segments': speaker_segments
         })
     
     step_end_time = time.time()
-    speaker_msg = f" ({speakers_detected} scenes with active speaker)" if detect_speaker and speakers_detected > 0 else ""
+    speaker_msg = f" ({speakers_detected} scenes with speaker detected)" if detect_speaker and speakers_detected > 0 else ""
     print(f"✅ Scene analysis complete in {step_end_time - step_start_time:.2f}s.{speaker_msg}")
 
     print("\n📋 Step 3: Generated Processing Plan")
@@ -2318,7 +2845,18 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
             for j, person in enumerate(scene_data['analysis']):
                 box = person['person_box']
                 box_size = f"{box[2]-box[0]}x{box[3]-box[1]}"
-                print(f"      Person {j+1}: box={box_size}, conf={person['confidence']:.2f}")
+                face_conf = person.get('face_confidence', 0)
+                face_info = f", face_conf={face_conf:.2f}" if face_conf > 0 else ", no face"
+                print(f"      Person {j+1}: box={box_size}, conf={person['confidence']:.2f}{face_info}")
+            
+            # Show speaker segments in verbose mode
+            if scene_data.get('speaker_segments'):
+                print(f"      Speaker timeline:")
+                for seg in scene_data['speaker_segments']:
+                    speaker = f"P{seg['speaker_idx']+1}" if seg['speaker_idx'] is not None else "?"
+                    seg_start = seg['start_frame'] / fps
+                    seg_end = seg['end_frame'] / fps
+                    print(f"        {seg_start:.1f}s-{seg_end:.1f}s: {speaker} (score: {seg['score']:.2f})")
 
     print("\n✂️ Step 4: Processing video frames...")
     step_start_time = time.time()

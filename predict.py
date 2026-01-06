@@ -1,5 +1,6 @@
 # Prediction interface for Cog ⚙️
 # https://cog.run/python
+# v2.1 - Speaker detection support
 
 from cog import BasePredictor, Input, Path
 import cv2
@@ -72,8 +73,8 @@ class Predictor(BasePredictor):
             default="balanced"
         ),
         detect_speaker: bool = Input(
-            description="Detect and focus on the active speaker using TalkNet AI. When multiple people are detected, focuses on who is speaking instead of split-screen.",
-            default=True
+            description="Detect and focus on the active speaker using TalkNet AI. When multiple people are detected, focuses on who is speaking instead of split-screen. WARNING: This is slow.",
+            default=False
         ),
         tracking_mode: str = Input(
             description="Camera tracking mode. Smooth = cinematic OpusClip-like movement. Static = fixed per-scene.",
