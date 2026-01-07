@@ -2,6 +2,7 @@ import time
 import cv2
 import scenedetect
 import subprocess
+import shutil
 from scenedetect import VideoManager, SceneManager
 from scenedetect.detectors import ContentDetector
 import os
@@ -620,10 +621,15 @@ def calculate_lip_movement(mouth_regions):
     return total_movement / valid_pairs
 
 
-def extract_scene_audio(video_path, start_time, duration):
+def extract_audio_for_segment(video_path, start_time, duration):
     """
-    Extract audio for entire scene ONCE.
+    Extract audio from a video segment.
     
+    Args:
+        video_path: Path to video file
+        start_time: Start time in seconds
+        duration: Duration in seconds
+        
     Returns:
         Audio array (16kHz mono) or None if extraction fails
     """
@@ -637,7 +643,6 @@ def extract_scene_audio(video_path, start_time, duration):
             'ffmpeg', '-y', '-i', video_path,
             '-ss', str(start_time), '-t', str(duration),
             '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
-            '-loglevel', 'error',
             tmp_audio_path
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -659,73 +664,75 @@ def extract_scene_audio(video_path, start_time, duration):
         return None
 
 
-def extract_scene_frames_cached(video_path, start_frame, end_frame, fps, target_fps=25):
+def extract_face_crops_for_talknet(video_path, face_box, start_frame, num_frames, fps):
     """
-    Extract and cache all frames for a scene ONCE.
-    Samples at target_fps (default 25fps for TalkNet).
+    Extract face crops formatted for TalkNet (112x112 grayscale).
+    TalkNet expects face crops at 25fps.
     
+    Args:
+        video_path: Path to video
+        face_box: Face bounding box [x1, y1, x2, y2]
+        start_frame: Starting frame number
+        num_frames: Number of frames to extract
+        fps: Video FPS
+        
     Returns:
-        List of (frame_num, frame) tuples
+        numpy array of shape (num_video_frames, 112, 112) or None
     """
     try:
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            return []
+            return None
         
-        # Sample at target fps
-        frame_step = max(1, int(fps / target_fps))
-        
-        cached_frames = []
-        for frame_num in range(start_frame, end_frame, frame_step):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-            ret, frame = cap.read()
-            if ret:
-                cached_frames.append((frame_num, frame))
-        
-        cap.release()
-        return cached_frames
-        
-    except Exception as e:
-        return []
-
-
-def extract_face_crop_from_frame(frame, face_box):
-    """
-    Extract TalkNet-formatted face crop from a single cached frame.
-    Returns 112x112 grayscale crop.
-    """
-    try:
         x1, y1, x2, y2 = face_box
         face_width = x2 - x1
         face_height = y2 - y1
         
-        if face_width <= 0 or face_height <= 0:
-            return None
-        
-        # Expand face box (TalkNet uses 40% crop scale)
+        # Expand face box to include more context (TalkNet uses 40% crop scale)
         center_x = (x1 + x2) / 2
         center_y = (y1 + y2) / 2
-        box_size = max(face_width, face_height) * 1.4
+        box_size = max(face_width, face_height) * 1.4  # 40% padding
         
-        h, w = frame.shape[:2]
-        crop_x1 = int(max(0, center_x - box_size / 2))
-        crop_y1 = int(max(0, center_y - box_size / 2))
-        crop_x2 = int(min(w, center_x + box_size / 2))
-        crop_y2 = int(min(h, center_y + box_size / 2))
+        frames = []
+        # Sample at 25fps for TalkNet
+        frame_step = max(1, int(fps / 25))
         
-        face_crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+        for i in range(0, num_frames, frame_step):
+            frame_num = start_frame + i
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            ret, frame = cap.read()
+            
+            if not ret:
+                continue
+            
+            h, w = frame.shape[:2]
+            
+            # Calculate crop coordinates
+            crop_x1 = int(max(0, center_x - box_size / 2))
+            crop_y1 = int(max(0, center_y - box_size / 2))
+            crop_x2 = int(min(w, center_x + box_size / 2))
+            crop_y2 = int(min(h, center_y + box_size / 2))
+            
+            face_crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+            
+            if face_crop.size == 0:
+                continue
+            
+            # Convert to grayscale
+            gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+            
+            # Resize to 224x224, then crop center 112x112 (TalkNet format)
+            resized = cv2.resize(gray, (224, 224))
+            center_crop = resized[56:168, 56:168]  # Center 112x112
+            
+            frames.append(center_crop)
         
-        if face_crop.size == 0:
+        cap.release()
+        
+        if len(frames) < 5:
             return None
         
-        # Convert to grayscale
-        gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
-        
-        # Resize to 224x224, then crop center 112x112 (TalkNet format)
-        resized = cv2.resize(gray, (224, 224))
-        center_crop = resized[56:168, 56:168]
-        
-        return center_crop
+        return np.array(frames)
         
     except Exception as e:
         return None
@@ -753,6 +760,7 @@ def run_talknet_inference(audio_array, video_frames):
         mfcc = python_speech_features.mfcc(audio_array, 16000, numcep=13, winlen=0.025, winstep=0.010)
         
         # Calculate length (TalkNet uses 4:1 audio:video ratio per second)
+        # 100 audio frames per second, 25 video frames per second
         length = min((mfcc.shape[0] - mfcc.shape[0] % 4) / 100, video_frames.shape[0] / 25)
         
         if length < 0.1:
@@ -773,115 +781,121 @@ def run_talknet_inference(audio_array, video_frames):
         with torch.no_grad():
             scores = TALKNET_MODEL(inputA, inputV)
         
+        # Return mean score (positive = speaking)
         return float(np.mean(scores))
         
     except Exception as e:
         return 0.0
 
 
-def detect_speakers_fast(video_path, scene_start_frame, scene_end_frame, 
-                         people_detections, fps, segment_duration=2.0):
+def detect_speaker_for_segment(video_path, start_frame, end_frame, people_detections, fps):
     """
-    FAST speaker detection - extracts audio/video ONCE, processes all at once.
-    ~10x faster than per-segment extraction.
+    Detect who is speaking in a specific time segment using TalkNet.
     
-    Based on optimization from: https://www.sievedata.com/blog/fast-active-speaker-detection
-    
+    Args:
+        video_path: Path to video
+        start_frame: Segment start frame
+        end_frame: Segment end frame
+        people_detections: List of detected people with face boxes
+        fps: Video FPS
+        
     Returns:
-        List of segment dicts with speaker_idx and score
+        Tuple of (speaker_index, score) or (None, 0) if no speaker detected
     """
+    if not TALKNET_AVAILABLE:
+        return None, 0.0
+    
     people_with_faces = [(i, p) for i, p in enumerate(people_detections) 
                         if p.get('face_box') is not None]
     
     if len(people_with_faces) == 0:
-        return []
+        return None, 0.0
     
-    scene_start_time = scene_start_frame / fps
-    scene_duration = (scene_end_frame - scene_start_frame) / fps
-    
-    # === STEP 1: Extract audio ONCE for entire scene ===
-    full_audio = extract_scene_audio(video_path, scene_start_time, scene_duration)
-    if full_audio is None:
-        return []
-    
-    # Check if there's any significant audio
-    audio_energy = np.sqrt(np.mean(full_audio ** 2))
-    if audio_energy < 100:
-        return []
-    
-    # === STEP 2: Extract ALL frames ONCE and cache them ===
-    cached_frames = extract_scene_frames_cached(video_path, scene_start_frame, scene_end_frame, fps)
-    if len(cached_frames) < 5:
-        return []
-    
-    # === STEP 3: Extract face crops for ALL people from cached frames ===
-    # Structure: {person_idx: [(frame_num, face_crop), ...]}
-    all_face_crops = {i: [] for i, _ in people_with_faces}
-    
-    for frame_num, frame in cached_frames:
+    try:
+        # Extract audio for segment
+        start_time = start_frame / fps
+        duration = (end_frame - start_frame) / fps
+        
+        audio = extract_audio_for_segment(video_path, start_time, duration)
+        if audio is None:
+            return None, 0.0
+        
+        # Check audio energy
+        audio_energy = np.sqrt(np.mean(audio ** 2))
+        if audio_energy < 100:  # Very quiet
+            return None, 0.0
+        
+        num_frames = end_frame - start_frame
+        
+        # Get speaking scores for each person
+        scores = {}
         for person_idx, person in people_with_faces:
             face_box = person['face_box']
-            face_crop = extract_face_crop_from_frame(frame, face_box)
-            if face_crop is not None:
-                all_face_crops[person_idx].append((frame_num, face_crop))
+            
+            # Extract face crops for this person
+            video_frames = extract_face_crops_for_talknet(
+                video_path, face_box, start_frame, num_frames, fps
+            )
+            
+            if video_frames is None:
+                scores[person_idx] = -1.0
+                continue
+            
+            # Run TalkNet inference
+            score = run_talknet_inference(audio, video_frames)
+            scores[person_idx] = score
+        
+        if not scores:
+            return None, 0.0
+        
+        # Find best speaker
+        best_idx = max(scores, key=scores.get)
+        best_score = scores[best_idx]
+        
+        # Score > 0 means speaking according to TalkNet
+        if best_score < 0:
+            return None, best_score
+        
+        return best_idx, best_score
+        
+    except Exception as e:
+        return None, 0.0
+
+
+def detect_per_segment_speakers(video_path, scene_start_frame, scene_end_frame, 
+                                 people_detections, fps, segment_duration=2.0):
+    """
+    Detect speakers per time segment within a scene.
+    This allows detecting alternating speakers in a conversation.
     
-    # === STEP 4: Segment analysis using cached data ===
-    segment_frames = int(segment_duration * fps)
+    Args:
+        video_path: Path to video
+        scene_start_frame: Scene start frame
+        scene_end_frame: Scene end frame
+        people_detections: List of detected people
+        fps: Video FPS
+        segment_duration: Duration of each analysis segment in seconds
+        
+    Returns:
+        List of (segment_start, segment_end, speaker_idx, score) tuples
+    """
     segments = []
-    current_frame = scene_start_frame
     
-    # Audio samples per frame (16kHz audio, video at fps)
-    audio_samples_per_frame = 16000 / fps
+    segment_frames = int(segment_duration * fps)
+    current_frame = scene_start_frame
     
     while current_frame < scene_end_frame:
         segment_end = min(current_frame + segment_frames, scene_end_frame)
         
-        # Get audio slice for this segment
-        audio_start_sample = int((current_frame - scene_start_frame) * audio_samples_per_frame)
-        audio_end_sample = int((segment_end - scene_start_frame) * audio_samples_per_frame)
-        segment_audio = full_audio[audio_start_sample:audio_end_sample]
-        
-        if len(segment_audio) < 1600:  # Less than 0.1s of audio
-            current_frame = segment_end
-            continue
-        
-        # Get face crops for this segment from cache
-        segment_scores = {}
-        
-        for person_idx, face_data in all_face_crops.items():
-            # Filter face crops for this segment
-            segment_crops = [crop for frame_num, crop in face_data 
-                           if current_frame <= frame_num < segment_end]
-            
-            if len(segment_crops) < 3:
-                segment_scores[person_idx] = -1.0
-                continue
-            
-            video_frames = np.array(segment_crops)
-            
-            # Run TalkNet inference
-            if TALKNET_AVAILABLE and TALKNET_MODEL is not None:
-                score = run_talknet_inference(segment_audio, video_frames)
-            else:
-                # Fallback: lip movement score
-                score = calculate_lip_movement(segment_crops)
-            
-            segment_scores[person_idx] = score
-        
-        # Determine speaker for this segment
-        if segment_scores:
-            best_idx = max(segment_scores, key=segment_scores.get)
-            best_score = segment_scores[best_idx]
-            speaker_idx = best_idx if best_score > 0 else None
-        else:
-            speaker_idx = None
-            best_score = 0.0
+        speaker_idx, score = detect_speaker_for_segment(
+            video_path, current_frame, segment_end, people_detections, fps
+        )
         
         segments.append({
             'start_frame': current_frame,
             'end_frame': segment_end,
             'speaker_idx': speaker_idx,
-            'score': best_score
+            'score': score
         })
         
         current_frame = segment_end
@@ -891,60 +905,68 @@ def detect_speakers_fast(video_path, scene_start_frame, scene_end_frame,
 
 def detect_conversation_mode(speaker_segments, people_detections):
     """
-    Analyze speaker segments to find who speaks the most.
-    
-    Instead of using split-screen for conversations, we now focus on
-    the person who speaks the most in the sequence.
+    Analyze speaker segments to detect if this is a conversation
+    where both people speak alternately.
     
     Args:
         speaker_segments: List of segment dictionaries with speaker info
         people_detections: List of detected people
         
     Returns:
-        Tuple of (is_conversation, dominant_speaker_idx)
-        - is_conversation: Always False now (we focus on dominant speaker)
-        - dominant_speaker_idx: Index of person who speaks the most, or None
+        Tuple of (is_conversation, primary_speakers)
+        - is_conversation: True if alternating speakers detected
+        - primary_speakers: List of person indices involved in conversation
     """
-    if len(speaker_segments) < 1:
-        return False, None
+    if len(people_detections) != 2 or len(speaker_segments) < 2:
+        return False, []
     
     # Count speaking time per person
     speaker_times = {}
+    speaker_count = {}
     
     for seg in speaker_segments:
         idx = seg['speaker_idx']
         if idx is not None and seg['score'] > 0:
             duration = seg['end_frame'] - seg['start_frame']
             speaker_times[idx] = speaker_times.get(idx, 0) + duration
+            speaker_count[idx] = speaker_count.get(idx, 0) + 1
     
-    if not speaker_times:
-        return False, None
+    # Check if both people speak
+    if len(speaker_times) < 2:
+        return False, list(speaker_times.keys()) if speaker_times else []
     
-    # Find who speaks the most
-    dominant_speaker = max(speaker_times, key=speaker_times.get)
+    # Check if both have significant speaking time (at least 20% each)
     total_speaking = sum(speaker_times.values())
+    if total_speaking == 0:
+        return False, []
     
-    if total_speaking > 0:
-        dominant_ratio = speaker_times[dominant_speaker] / total_speaking
-        print(f"  🎤 Speaker analysis: Person {dominant_speaker + 1} speaks {dominant_ratio*100:.0f}% of the time")
+    ratios = {k: v / total_speaking for k, v in speaker_times.items()}
     
-    # Always return the dominant speaker (no split-screen)
-    return False, dominant_speaker
+    # Both should have at least 20% and at most 80%
+    if all(0.2 <= r <= 0.8 for r in ratios.values()):
+        # Check for alternation (at least 2 speaker switches)
+        switches = 0
+        prev_speaker = None
+        for seg in speaker_segments:
+            if seg['speaker_idx'] is not None and seg['score'] > 0:
+                if prev_speaker is not None and seg['speaker_idx'] != prev_speaker:
+                    switches += 1
+                prev_speaker = seg['speaker_idx']
+        
+        if switches >= 1:  # At least one speaker change
+            return True, list(speaker_times.keys())
+    
+    return False, list(speaker_times.keys())
 
 
-def detect_active_speaker_talknet(video_path, scene_start_frame, scene_end_frame, 
-                                   people_detections, fps):
+def detect_speaker_fast(video_path, scene_start_frame, scene_end_frame, 
+                        people_detections, fps, segment_duration=2.0):
     """
-    FAST TalkNet-based active speaker detection.
-    
-    Optimized to extract audio/video ONCE per scene (not per segment).
-    Always focuses on the person who speaks the most.
+    Fast speaker detection using lip movement + audio correlation.
+    Much faster than TalkNet neural network (~10x faster).
     
     Returns:
         Tuple of (speaker_index, is_conversation, speaker_segments)
-        - speaker_index: Person who speaks the most
-        - is_conversation: Always False (we always focus on dominant speaker)
-        - speaker_segments: Per-segment data for debugging
     """
     people_with_faces = [(i, p) for i, p in enumerate(people_detections) 
                         if p.get('face_box') is not None]
@@ -953,40 +975,236 @@ def detect_active_speaker_talknet(video_path, scene_start_frame, scene_end_frame
         return None, False, []
     
     if len(people_with_faces) == 1:
-        # Single person - return them as speaker
-        return people_with_faces[0][0], False, []
+        return None, False, []  # Can't compare with single person
     
     try:
-        scene_duration = (scene_end_frame - scene_start_frame) / fps
+        # Extract audio activity for the scene
+        audio_segments = extract_audio_activity(video_path, fps, scene_end_frame, chunk_duration=0.5)
         
-        # Use shorter segments for better speaker detection
-        segment_duration = min(2.0, scene_duration / 3)
-        segment_duration = max(1.0, segment_duration)
-        
-        # Use FAST detection (extracts audio/video once)
-        speaker_segments = detect_speakers_fast(
-            video_path, scene_start_frame, scene_end_frame,
-            people_detections, fps, segment_duration
-        )
-        
-        if not speaker_segments:
+        if not audio_segments:
             return None, False, []
         
-        # Find the person who speaks the most
-        _, dominant_speaker = detect_conversation_mode(
-            speaker_segments, people_detections
-        )
+        # Build frame-to-energy map
+        frame_audio_energy = {}
+        for start_f, end_f, energy in audio_segments:
+            for f in range(int(start_f), int(end_f) + 1):
+                frame_audio_energy[f] = energy
         
-        if dominant_speaker is not None:
-            return dominant_speaker, False, speaker_segments
+        # Open video once and collect all mouth data
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None, False, []
         
-        return None, False, speaker_segments
+        scene_duration_frames = scene_end_frame - scene_start_frame
+        segment_frames = int(segment_duration * fps)
+        
+        # Sample frames efficiently (every 3rd frame for speed)
+        sample_step = max(3, int(fps / 10))  # ~10 samples per second max
+        
+        # Collect mouth regions per person per segment
+        segments_data = []
+        current_frame = scene_start_frame
+        
+        while current_frame < scene_end_frame:
+            segment_end = min(current_frame + segment_frames, scene_end_frame)
+            
+            # Sample frames in this segment
+            segment_mouths = {i: [] for i, _ in people_with_faces}
+            
+            for frame_num in range(current_frame, segment_end, sample_step):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                
+                for person_idx, person in people_with_faces:
+                    face_box = person['face_box']
+                    mouth_region = get_mouth_region(face_box, frame)
+                    audio_energy = frame_audio_energy.get(frame_num, 0.0)
+                    segment_mouths[person_idx].append((mouth_region, frame_num, audio_energy))
+            
+            # Calculate speaking score for each person in this segment
+            segment_scores = {}
+            for person_idx, mouth_data in segment_mouths.items():
+                if len(mouth_data) < 3:
+                    segment_scores[person_idx] = 0.0
+                    continue
+                
+                # Calculate movement correlated with audio
+                audio_movement = 0.0
+                silent_movement = 0.0
+                audio_frames = 0
+                silent_frames = 0
+                
+                for i in range(1, len(mouth_data)):
+                    prev_mouth, _, prev_energy = mouth_data[i - 1]
+                    curr_mouth, _, curr_energy = mouth_data[i]
+                    
+                    if prev_mouth is None or curr_mouth is None:
+                        continue
+                    
+                    diff = cv2.absdiff(prev_mouth, curr_mouth)
+                    movement = np.mean(diff)
+                    
+                    avg_energy = (prev_energy + curr_energy) / 2
+                    if avg_energy > 0.1:
+                        audio_movement += movement
+                        audio_frames += 1
+                    else:
+                        silent_movement += movement
+                        silent_frames += 1
+                
+                # Score: movement during audio minus movement during silence
+                if audio_frames > 0 and silent_frames > 0:
+                    segment_scores[person_idx] = (audio_movement / audio_frames) - (silent_movement / silent_frames)
+                elif audio_frames > 0:
+                    segment_scores[person_idx] = audio_movement / audio_frames
+                else:
+                    segment_scores[person_idx] = 0.0
+            
+            # Determine speaker for this segment
+            if segment_scores:
+                best_idx = max(segment_scores, key=segment_scores.get)
+                best_score = segment_scores[best_idx]
+                
+                # Only assign speaker if score is significant
+                if best_score > 2.0:
+                    speaker_idx = best_idx
+                else:
+                    speaker_idx = None
+            else:
+                speaker_idx = None
+                best_score = 0.0
+            
+            segments_data.append({
+                'start_frame': current_frame,
+                'end_frame': segment_end,
+                'speaker_idx': speaker_idx,
+                'score': best_score,
+                'all_scores': segment_scores
+            })
+            
+            current_frame = segment_end
+        
+        cap.release()
+        
+        # Analyze segments for conversation mode
+        is_conversation, speakers = detect_conversation_mode(segments_data, people_detections)
+        
+        if is_conversation:
+            return None, True, segments_data
+        
+        # Find dominant speaker
+        if len(speakers) == 1:
+            return speakers[0], False, segments_data
+        elif len(speakers) > 1:
+            speaker_times = {}
+            for seg in segments_data:
+                idx = seg['speaker_idx']
+                if idx is not None and seg['score'] > 2.0:
+                    duration = seg['end_frame'] - seg['start_frame']
+                    speaker_times[idx] = speaker_times.get(idx, 0) + duration
+            
+            if speaker_times:
+                dominant = max(speaker_times, key=speaker_times.get)
+                total = sum(speaker_times.values())
+                if total > 0 and speaker_times[dominant] / total > 0.7:
+                    return dominant, False, segments_data
+            
+            # No clear dominant - conversation mode
+            return None, True, segments_data
+        
+        return None, False, segments_data
         
     except Exception as e:
-        print(f"  ⚠️  Speaker detection failed: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"  ⚠️  Fast speaker detection failed: {e}")
         return None, False, []
+
+
+def detect_active_speaker_talknet(video_path, scene_start_frame, scene_end_frame, 
+                                   people_detections, fps, use_neural_network=False):
+    """
+    Detect active speaker using audio-visual analysis.
+    
+    Args:
+        use_neural_network: If True, use full TalkNet neural network (slow but accurate).
+                           If False, use fast lip-movement detection (default).
+    
+    Returns:
+        Tuple of (speaker_index, is_conversation, speaker_segments)
+    """
+    # Use fast detection by default (10x faster than neural network)
+    if not use_neural_network:
+        return detect_speaker_fast(video_path, scene_start_frame, scene_end_frame,
+                                   people_detections, fps)
+    
+    # Full TalkNet neural network (slow - ~3 mins for 1.5 min video)
+    if not TALKNET_AVAILABLE:
+        return detect_speaker_fast(video_path, scene_start_frame, scene_end_frame,
+                                   people_detections, fps)
+    
+    people_with_faces = [(i, p) for i, p in enumerate(people_detections) 
+                        if p.get('face_box') is not None]
+    
+    if len(people_with_faces) == 0:
+        return None, False, []
+    
+    try:
+        # For scenes with 2 people, use per-segment detection
+        if len(people_with_faces) == 2:
+            scene_duration = (scene_end_frame - scene_start_frame) / fps
+            
+            # Use shorter segments for better conversation detection
+            segment_duration = min(2.0, scene_duration / 3)
+            segment_duration = max(1.0, segment_duration)
+            
+            speaker_segments = detect_per_segment_speakers(
+                video_path, scene_start_frame, scene_end_frame,
+                people_detections, fps, segment_duration
+            )
+            
+            # Check for conversation (alternating speakers)
+            is_conversation, speakers = detect_conversation_mode(
+                speaker_segments, people_detections
+            )
+            
+            if is_conversation:
+                return None, True, speaker_segments
+            
+            if len(speakers) == 1:
+                return speakers[0], False, speaker_segments
+            elif len(speakers) > 1:
+                speaker_times = {}
+                for seg in speaker_segments:
+                    idx = seg['speaker_idx']
+                    if idx is not None and seg['score'] > 0:
+                        duration = seg['end_frame'] - seg['start_frame']
+                        speaker_times[idx] = speaker_times.get(idx, 0) + duration
+                
+                if speaker_times:
+                    dominant = max(speaker_times, key=speaker_times.get)
+                    total = sum(speaker_times.values())
+                    if speaker_times[dominant] / total > 0.7:
+                        return dominant, False, speaker_segments
+                
+                return None, True, speaker_segments
+            
+            return None, False, speaker_segments
+        
+        # Single person or 3+ people - use simpler detection
+        speaker_idx, score = detect_speaker_for_segment(
+            video_path, scene_start_frame, scene_end_frame, people_detections, fps
+        )
+        
+        if speaker_idx is not None and score > 0:
+            return speaker_idx, False, []
+        
+        return None, False, []
+        
+    except Exception as e:
+        print(f"  ⚠️  TalkNet speaker detection failed: {e}")
+        return detect_speaker_fast(video_path, scene_start_frame, scene_end_frame,
+                                   people_detections, fps)
 
 
 def compute_speaking_score_fallback(face_sequence, audio_energy_segments):
@@ -1053,7 +1271,7 @@ def detect_active_speaker(video_path, scene_start_frame, scene_end_frame, people
     Detect who is the active speaker in a scene.
     Uses TalkNet (audio-visual) if available, otherwise falls back to lip movement analysis.
     
-    Always focuses on the person who speaks the MOST (no split-screen).
+    Now also detects CONVERSATION MODE where both people speak alternately.
     
     Args:
         video_path: Path to video
@@ -1067,9 +1285,9 @@ def detect_active_speaker(video_path, scene_start_frame, scene_end_frame, people
         
     Returns:
         Tuple of (speaker_index, is_conversation, speaker_segments)
-        - speaker_index: Index of person who speaks the most
-        - is_conversation: Always False (we focus on dominant speaker)
-        - speaker_segments: Per-segment speaker data for debugging
+        - speaker_index: Index of active speaker, or None if conversation/undetermined
+        - is_conversation: True if both people speak (should use split-screen)
+        - speaker_segments: Per-segment speaker data for dynamic tracking
     """
     if not people_detections:
         return None, False, []
@@ -1080,15 +1298,24 @@ def detect_active_speaker(video_path, scene_start_frame, scene_end_frame, people
     if len(people_with_faces) == 0:
         return None, False, []
     
-    # Single person - return them as speaker
+    # Single person - check if they're speaking
     if len(people_with_faces) == 1:
-        return people_with_faces[0][0], False, []
+        audio_segments = extract_audio_activity(video_path, fps, scene_end_frame, chunk_duration=0.3)
+        if audio_segments:
+            total_energy = sum(s[2] for s in audio_segments)
+            if total_energy > 0.5:
+                return people_with_faces[0][0], False, []
+        return None, False, []
     
-    # Try TalkNet first (most accurate)
+    # Try TalkNet first (most accurate) - now returns conversation info
     if TALKNET_AVAILABLE:
-        speaker_idx, _, segments = detect_active_speaker_talknet(
+        speaker_idx, is_conversation, segments = detect_active_speaker_talknet(
             video_path, scene_start_frame, scene_end_frame, people_detections, fps
         )
+        
+        if is_conversation:
+            print(f"  💬 Conversation detected - both people speak alternately")
+            return None, True, segments
         
         if speaker_idx is not None:
             return speaker_idx, False, segments
@@ -1109,8 +1336,7 @@ def detect_active_speaker(video_path, scene_start_frame, scene_end_frame, people
     
     if num_samples < 5:
         cap.release()
-        # Return first person as fallback
-        return people_with_faces[0][0], False, []
+        return None, False, []
     
     sample_frames = np.linspace(scene_start_frame, scene_end_frame - 1, num_samples, dtype=int)
     
@@ -1141,17 +1367,40 @@ def detect_active_speaker(video_path, scene_start_frame, scene_end_frame, people
         movement_scores[person_idx] = score
     
     if not movement_scores:
-        return people_with_faces[0][0], False, []
+        return None, False, []
     
-    # Find the person who speaks the MOST (highest score)
+    # Check if multiple people have significant speaking scores
+    speaking_people = [idx for idx, score in movement_scores.items() if score > 2.0]
+    
+    if len(speaking_people) >= 2:
+        # Multiple people speaking - check if it's conversation-like
+        scores_list = list(movement_scores.values())
+        if len(scores_list) >= 2:
+            max_score = max(scores_list)
+            second_max = sorted(scores_list)[-2]
+            
+            # If second person has > 30% of max speaker's score, it's a conversation
+            if second_max > max_score * 0.3:
+                print(f"  💬 Conversation detected (fallback) - both people appear to speak")
+                return None, True, []
+    
+    # Find best candidate
+    max_score = max(movement_scores.values())
+    threshold = 3.0
+    
+    if max_score < threshold:
+        return None, False, []
+    
     speaker_idx = max(movement_scores, key=movement_scores.get)
-    max_score = movement_scores[speaker_idx]
+    other_scores = [v for k, v in movement_scores.items() if k != speaker_idx]
     
-    # Log the analysis
-    total_score = sum(movement_scores.values())
-    if total_score > 0:
-        ratio = max_score / total_score * 100
-        print(f"  🎤 Fallback: Person {speaker_idx + 1} speaks {ratio:.0f}% (score: {max_score:.1f})")
+    if other_scores:
+        max_other = max(other_scores)
+        if max_other > 0 and movement_scores[speaker_idx] / max_other < 2.0:
+            # Not enough difference - might be conversation
+            if max_other > threshold * 0.5:
+                return None, True, []
+            return None, False, []
     
     return speaker_idx, False, []
 
@@ -1224,27 +1473,21 @@ def load_dnn_face_detector():
         print("   Falling back to Haar Cascade (no confidence scores)")
         return None
 
-def compute_saliency_region(frame, aspect_ratio, padding_factor=1.5, max_zoom=2.5):
+def compute_saliency_region(frame, aspect_ratio, padding_factor=1.5):
     """
     Compute the most salient (visually interesting) region in a frame.
-    Uses OpenCV's Spectral Residual saliency detection if available.
-    Returns None if saliency isn't confident enough or would require too much zoom.
+    Uses OpenCV's Spectral Residual saliency detection.
     
     Args:
         frame: Input frame (BGR)
         aspect_ratio: Target aspect ratio (width/height)
         padding_factor: How much padding around salient region (1.5 = 50% padding)
-        max_zoom: Maximum zoom factor allowed (default 2.5x)
         
     Returns:
-        Bounding box [x1, y1, x2, y2] of the most salient region, or None if not confident
+        Bounding box [x1, y1, x2, y2] of the most salient region, or None if failed
     """
     try:
         frame_height, frame_width = frame.shape[:2]
-        
-        # Check if saliency module is available (requires opencv-contrib-python)
-        if not hasattr(cv2, 'saliency'):
-            return None
         
         # Create saliency detector
         saliency = cv2.saliency.StaticSaliencySpectralResidual_create()
@@ -1261,11 +1504,6 @@ def compute_saliency_region(frame, aspect_ratio, padding_factor=1.5, max_zoom=2.
         # Apply Gaussian blur to smooth the map
         saliency_map = cv2.GaussianBlur(saliency_map, (25, 25), 0)
         
-        # Check saliency confidence - if max saliency is low, not confident
-        max_saliency = np.max(saliency_map)
-        if max_saliency < 50:  # Low contrast saliency map = not confident
-            return None
-        
         # Threshold to find salient regions (top 20% most salient)
         threshold = np.percentile(saliency_map, 80)
         _, binary_map = cv2.threshold(saliency_map, threshold, 255, cv2.THRESH_BINARY)
@@ -1274,17 +1512,29 @@ def compute_saliency_region(frame, aspect_ratio, padding_factor=1.5, max_zoom=2.
         contours, _ = cv2.findContours(binary_map, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         if not contours:
-            # No distinct salient region found
-            return None
+            # No distinct salient region - use center of mass of saliency
+            moments = cv2.moments(saliency_map)
+            if moments['m00'] > 0:
+                cx = int(moments['m10'] / moments['m00'])
+                cy = int(moments['m01'] / moments['m00'])
+            else:
+                # Fallback to center
+                cx, cy = frame_width // 2, frame_height // 2
+            
+            # Create a region around center of mass
+            region_height = frame_height // 3
+            region_width = int(region_height * aspect_ratio)
+            
+            x1 = max(0, cx - region_width // 2)
+            y1 = max(0, cy - region_height // 2)
+            x2 = min(frame_width, x1 + region_width)
+            y2 = min(frame_height, y1 + region_height)
+            
+            return [x1, y1, x2, y2]
         
         # Get bounding box of all salient contours combined
         all_points = np.vstack(contours)
         x, y, w, h = cv2.boundingRect(all_points)
-        
-        # Check if salient region is too small (would require excessive zoom)
-        salient_area_ratio = (w * h) / (frame_width * frame_height)
-        if salient_area_ratio < 0.05:  # Less than 5% of frame = too small
-            return None
         
         # Add padding around the salient region
         center_x = x + w // 2
@@ -1293,27 +1543,19 @@ def compute_saliency_region(frame, aspect_ratio, padding_factor=1.5, max_zoom=2.
         padded_w = int(w * padding_factor)
         padded_h = int(h * padding_factor)
         
-        # Ensure minimum size (at least 40% of frame to avoid excessive zoom)
-        min_size = 1.0 / max_zoom  # e.g., max_zoom=2.5 means min 40% of frame
-        padded_w = max(padded_w, int(frame_width * min_size))
-        padded_h = max(padded_h, int(frame_height * min_size))
+        # Ensure minimum size (at least 30% of frame)
+        padded_w = max(padded_w, int(frame_width * 0.3))
+        padded_h = max(padded_h, int(frame_height * 0.3))
         
         x1 = max(0, center_x - padded_w // 2)
         y1 = max(0, center_y - padded_h // 2)
         x2 = min(frame_width, center_x + padded_w // 2)
         y2 = min(frame_height, center_y + padded_h // 2)
         
-        # Final check: would this crop require too much zoom?
-        crop_width = x2 - x1
-        crop_height = y2 - y1
-        zoom_factor = max(frame_width / crop_width, frame_height / crop_height)
-        
-        if zoom_factor > max_zoom:
-            return None
-        
         return [x1, y1, x2, y2]
         
     except Exception as e:
+        print(f"  ⚠️  Saliency detection failed: {e}")
         return None
 
 
@@ -1391,12 +1633,9 @@ def detect_face_dnn(frame, face_net, person_box=None, min_confidence=0.5):
     return faces
 
 
-def analyze_single_frame(frame, model, face_cascade, dnn_face_detector, analysis_scale, confidence_threshold, min_face_confidence=0.6):
+def analyze_single_frame(frame, model, face_cascade, dnn_face_detector, analysis_scale, confidence_threshold):
     """
     Analyze a single frame for people and faces.
-    
-    Args:
-        min_face_confidence: Minimum confidence to consider a face valid (default 0.6)
     
     Returns:
         List of detected objects with person_box, face_box, confidence, face_confidence
@@ -1451,21 +1690,15 @@ def analyze_single_frame(frame, model, face_cascade, dnn_face_detector, analysis
                     faces = detect_face_dnn(frame, dnn_face_detector, person_box, min_confidence=0.5)
                     if faces:
                         faces.sort(key=lambda x: x[1], reverse=True)
-                        detected_face_box, detected_face_conf = faces[0]
-                        # Only accept face if confidence is high enough
-                        if detected_face_conf >= min_face_confidence:
-                            face_box = detected_face_box
-                            face_confidence = detected_face_conf
+                        face_box, face_confidence = faces[0]
                 else:
                     person_roi_gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
                     faces = face_cascade.detectMultiScale(person_roi_gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
                     
                     if len(faces) > 0:
                         fx, fy, fw, fh = faces[0]
-                        # Haar cascade doesn't give confidence, assume 0.7
-                        if 0.7 >= min_face_confidence:
-                            face_box = [x1 + fx, y1 + fy, x1 + fx + fw, y1 + fy + fh]
-                            face_confidence = 0.7
+                        face_box = [x1 + fx, y1 + fy, x1 + fx + fw, y1 + fy + fh]
+                        face_confidence = 0.8
 
                 detected_objects.append({
                     'person_box': person_box, 
@@ -1477,11 +1710,8 @@ def analyze_single_frame(frame, model, face_cascade, dnn_face_detector, analysis
     # Fallback: face detection if no people found
     if len(detected_objects) == 0:
         if dnn_face_detector is not None:
-            # Use stricter confidence for fallback face detection
-            faces = detect_face_dnn(frame, dnn_face_detector, min_confidence=min_face_confidence)
+            faces = detect_face_dnn(frame, dnn_face_detector, min_confidence=0.4)
             for face_box, face_conf in faces:
-                if face_conf < min_face_confidence:
-                    continue
                 fx1, fy1, fx2, fy2 = face_box
                 fw, fh = fx2 - fx1, fy2 - fy1
                 estimated_body_height = fh * 5
@@ -1499,27 +1729,25 @@ def analyze_single_frame(frame, model, face_cascade, dnn_face_detector, analysis
                     'face_confidence': face_conf
                 })
         else:
-            # Haar cascade fallback - only use if min_face_confidence allows
-            if min_face_confidence <= 0.7:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
-                
-                for (x, y, w, h) in faces:
-                    face_box = [x, y, x + w, y + h]
-                    estimated_body_height = h * 5
-                    padding_x = int(w * 0.8)
-                    person_box = [
-                        max(0, x - padding_x),
-                        max(0, y - int(h * 0.3)),
-                        min(frame_width, x + w + padding_x),
-                        min(frame_height, y + estimated_body_height)
-                    ]
-                    detected_objects.append({
-                        'person_box': person_box, 
-                        'face_box': face_box,
-                        'confidence': 0.4,
-                        'face_confidence': 0.7
-                    })
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(50, 50))
+            
+            for (x, y, w, h) in faces:
+                face_box = [x, y, x + w, y + h]
+                estimated_body_height = h * 5
+                padding_x = int(w * 0.8)
+                person_box = [
+                    max(0, x - padding_x),
+                    max(0, y - int(h * 0.3)),
+                    min(frame_width, x + w + padding_x),
+                    min(frame_height, y + estimated_body_height)
+                ]
+                detected_objects.append({
+                    'person_box': person_box, 
+                    'face_box': face_box,
+                    'confidence': 0.4,
+                    'face_confidence': 0.7
+                })
     
     return detected_objects
 
@@ -1637,7 +1865,7 @@ def merge_detections_across_frames(all_frame_detections, iou_threshold=0.5):
 def compute_scene_fallback(video_path, scene_start_time, scene_end_time, aspect_ratio, fallback_strategy='saliency'):
     """
     Compute a fallback crop region for scenes without people.
-    Uses saliency detection if confident, otherwise letterbox.
+    Uses saliency detection or center crop.
     
     Args:
         video_path: Path to video
@@ -1671,19 +1899,16 @@ def compute_scene_fallback(video_path, scene_start_time, scene_end_time, aspect_
     frame_height, frame_width = frame.shape[:2]
     
     if fallback_strategy == 'saliency':
-        # Try saliency detection - returns None if not confident or requires too much zoom
+        # Try saliency detection
         saliency_box = compute_saliency_region(frame, aspect_ratio)
         if saliency_box:
             print(f"  🎯 Using saliency detection (no people found)")
             return saliency_box
-        # Saliency not confident - use letterbox
-        return None
+        # Fall through to center if saliency fails
     
-    if fallback_strategy == 'center':
-        print(f"  📍 Using center crop (no people found)")
-        return get_center_crop_box(frame_width, frame_height, aspect_ratio)
-    
-    return None
+    # Center crop fallback
+    print(f"  📍 Using center crop (no people found)")
+    return get_center_crop_box(frame_width, frame_height, aspect_ratio)
 
 
 def analyze_scene_content(video_path, scene_start_time, scene_end_time, model, face_cascade, analysis_scale=1.0, dnn_face_detector=None, confidence_threshold=0.3, num_sample_frames=3):
@@ -1799,20 +2024,11 @@ def detect_scenes(video_path):
     scene_manager.detect_scenes(frame_source=video_manager)
     scene_list = scene_manager.get_scene_list()
     fps = video_manager.get_framerate()
-    
-    # If no scene cuts detected, treat the entire video as a single scene
-    if not scene_list:
-        base_timecode = video_manager.get_base_timecode()
-        end_timecode = video_manager.get_current_timecode()
-        scene_list = [(base_timecode, end_timecode)]
-        print("  ℹ️  No scene cuts detected - treating entire video as one scene")
-    
     video_manager.release()
     return scene_list, fps
 
 
 def get_enclosing_box(boxes):
-    """Get the smallest box that encloses all given boxes."""
     if not boxes:
         return None
     min_x = min(box[0] for box in boxes)
@@ -1820,54 +2036,6 @@ def get_enclosing_box(boxes):
     max_x = max(box[2] for box in boxes)
     max_y = max(box[3] for box in boxes)
     return [min_x, min_y, max_x, max_y]
-
-
-def get_centered_group_box(boxes, frame_width, frame_height):
-    """
-    Get an enclosing box that centers the group of people.
-    Instead of just bounding box, this creates a box centered on the 
-    midpoint between all people, ensuring they're centered in the crop.
-    """
-    if not boxes:
-        return None
-    
-    if len(boxes) == 1:
-        return boxes[0]
-    
-    # Find the center of each person
-    centers = []
-    for box in boxes:
-        cx = (box[0] + box[2]) / 2
-        cy = (box[1] + box[3]) / 2
-        centers.append((cx, cy))
-    
-    # Calculate midpoint between all centers
-    mid_x = sum(c[0] for c in centers) / len(centers)
-    mid_y = sum(c[1] for c in centers) / len(centers)
-    
-    # Get the enclosing box dimensions
-    min_x = min(box[0] for box in boxes)
-    min_y = min(box[1] for box in boxes)
-    max_x = max(box[2] for box in boxes)
-    max_y = max(box[3] for box in boxes)
-    
-    box_width = max_x - min_x
-    box_height = max_y - min_y
-    
-    # Create a new box centered on the midpoint but with same dimensions
-    # This ensures people are centered rather than offset
-    new_x1 = mid_x - box_width / 2
-    new_y1 = mid_y - box_height / 2
-    new_x2 = mid_x + box_width / 2
-    new_y2 = mid_y + box_height / 2
-    
-    # Ensure the box still contains all people (expand if needed)
-    new_x1 = min(new_x1, min_x)
-    new_y1 = min(new_y1, min_y)
-    new_x2 = max(new_x2, max_x)
-    new_y2 = max(new_y2, max_y)
-    
-    return [new_x1, new_y1, new_x2, new_y2]
 
 
 def would_require_excessive_zoom(target_box, frame_width, frame_height, aspect_ratio, max_zoom=4.0):
@@ -1926,37 +2094,31 @@ def calculate_overlap_ratio(box1, box2):
 def are_people_too_close_for_split(person1, person2, frame_width, frame_height, aspect_ratio):
     """
     Check if two people are too close together for split-screen to work well.
-    If their crops would overlap significantly or look too similar, split-screen won't look good.
+    If their crops would overlap significantly, split-screen won't look good.
     
-    Returns True if split-screen would look bad (should track one instead)
+    Returns True if people are too close (should track one instead of split)
     """
     box1 = person1['person_box']
     box2 = person2['person_box']
     
     # Check direct overlap of person boxes
     direct_overlap = calculate_overlap_ratio(box1, box2)
-    if direct_overlap > 0.2:  # More than 20% overlap (stricter)
-        print(f"  ⚠️  Person boxes overlap too much ({direct_overlap:.0%})")
+    if direct_overlap > 0.3:  # More than 30% overlap
         return True
     
     # Check horizontal separation - for split to work, people need horizontal space
     center1_x = (box1[0] + box1[2]) / 2
     center2_x = (box2[0] + box2[2]) / 2
     
-    # STRICT: Minimum horizontal distance required for split-screen
-    # People must be at least 30% of frame width apart
-    horizontal_distance = abs(center1_x - center2_x) / frame_width
-    if horizontal_distance < 0.30:
-        print(f"  ⚠️  People too close horizontally ({horizontal_distance:.0%} apart, need 30%+)")
-        return True
-    
     # Calculate how wide each person's crop would be
+    # For split-screen, each person gets a crop that's approximately:
+    # crop_width = person_height * 1.5 * section_aspect_ratio (rough estimate)
     person1_height = box1[3] - box1[1]
     person2_height = box2[3] - box2[1]
     
     # Section aspect for vertical stacking (9:16 split in half vertically)
     if aspect_ratio < 0.8:  # Vertical output
-        section_aspect = aspect_ratio * 2
+        section_aspect = aspect_ratio * 2  # Each section is wider relative to its height
     else:
         section_aspect = aspect_ratio / 2
     
@@ -1979,28 +2141,8 @@ def are_people_too_close_for_split(person1, person2, frame_width, frame_height, 
         smaller_crop_width = min(crop_width1, crop_width2)
         crop_overlap_ratio = overlap_width / smaller_crop_width if smaller_crop_width > 0 else 0
         
-        if crop_overlap_ratio > 0.3:  # More than 30% crop overlap (stricter)
-            print(f"  ⚠️  Crop regions would overlap too much ({crop_overlap_ratio:.0%})")
+        if crop_overlap_ratio > 0.5:  # More than 50% crop overlap
             return True
-    
-    # Check if both people are too centered (crops would show same content)
-    frame_center_x = frame_width / 2
-    dist1_from_center = abs(center1_x - frame_center_x) / frame_width
-    dist2_from_center = abs(center2_x - frame_center_x) / frame_width
-    
-    # If both people are within 35% of center, crops would be too similar
-    if dist1_from_center < 0.35 and dist2_from_center < 0.35:
-        print(f"  ⚠️  Both people too centered, crops would be similar")
-        return True
-    
-    # Check if people are on same side of frame
-    same_side = (center1_x < frame_center_x and center2_x < frame_center_x) or \
-                (center1_x > frame_center_x and center2_x > frame_center_x)
-    
-    # If both on same side, crops would show similar background
-    if same_side:
-        print(f"  ⚠️  Both people on same side of frame, crops would be similar")
-        return True
     
     return False
 
@@ -2049,33 +2191,29 @@ def decide_cropping_strategy(scene_analysis, frame_height, frame_width, aspect_r
     # Multiple people detected - sort by confidence and take top detections
     sorted_by_confidence = sorted(scene_analysis, key=lambda x: x['confidence'], reverse=True)
     
-    # No split-screen for square format (1:1) - not enough vertical space
-    is_square_format = 0.9 <= aspect_ratio <= 1.1
-    
     # For 2-3 people, try to include them all
     people_to_track = sorted_by_confidence[:min(3, num_people)]
     
     person_boxes = [obj['person_box'] for obj in people_to_track]
-    # Use centered group box to center the people in the frame
-    group_box = get_centered_group_box(person_boxes, frame_width, frame_height)
+    group_box = get_enclosing_box(person_boxes)
     group_width = group_box[2] - group_box[0]
     max_width_for_crop = frame_height * aspect_ratio
     
-    # If people fit horizontally, track the group (centered)
+    # If people fit horizontally, track the group
     if group_width < max_width_for_crop * 1.2:  # Allow 20% overflow (will be handled by crop)
         # Check if group is reasonably sized
         if not would_require_excessive_zoom(group_box, frame_width, frame_height, aspect_ratio, max_zoom):
             return 'TRACK', group_box
     
     # If exactly 2 people are too far apart for single crop, consider stacking
-    # But NOT for square format - split-screen doesn't work well
-    if num_people == 2 and not is_square_format:
+    if num_people == 2:
         person1, person2 = scene_analysis[0], scene_analysis[1]
         
         # Check if people are too close for split-screen
         if are_people_too_close_for_split(person1, person2, frame_width, frame_height, aspect_ratio):
             # People are too close - track the most confident person only
             best_person = sorted_by_confidence[0]
+            print(f"  ⚠️  People too close for split-screen, tracking single person")
             return 'TRACK', best_person['person_box']
         
         # Check if people are reasonably sized for stacking
@@ -2101,16 +2239,11 @@ def decide_cropping_strategy(scene_analysis, frame_height, frame_width, aspect_r
     if num_people >= 3:
         top_two = sorted_by_confidence[:2]
         two_person_boxes = [obj['person_box'] for obj in top_two]
-        # Use centered group box to center both people
-        two_group_box = get_centered_group_box(two_person_boxes, frame_width, frame_height)
+        two_group_box = get_enclosing_box(two_person_boxes)
         two_group_width = two_group_box[2] - two_group_box[0]
         
         if two_group_width < max_width_for_crop:
             return 'TRACK', two_group_box
-        
-        # No split-screen for square format
-        if is_square_format:
-            return 'TRACK', sorted_by_confidence[0]['person_box']
         
         # Check if top 2 are too close for split
         if are_people_too_close_for_split(top_two[0], top_two[1], frame_width, frame_height, aspect_ratio):
@@ -2736,7 +2869,7 @@ def get_video_codec(video_path):
         return None
 
 
-def process_video(input_video, final_output_video, model, face_cascade, aspect_ratio=9/16, analysis_scale=1.0, use_gpu=False, confidence_threshold=0.3, use_dnn_face=True, num_sample_frames=3, detect_speaker=False, fallback_strategy='saliency', tracking_mode='smooth', tracking_smoothness=0.08, verbose=False):
+def process_video(input_video, final_output_video, model, face_cascade, aspect_ratio=9/16, analysis_scale=1.0, use_gpu=False, confidence_threshold=0.3, use_dnn_face=True, num_sample_frames=3, detect_speaker=True, fallback_strategy='saliency', tracking_mode='smooth', tracking_smoothness=0.08, verbose=False):
     """
     Main video processing function that converts horizontal video to vertical format.
     OpusClip-like quality with smooth tracking and real-time subject following.
@@ -2759,6 +2892,19 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
         verbose: Show detailed debug info for each scene. Default: False
     """
     script_start_time = time.time()
+    
+    # Check if video is already close to the target aspect ratio
+    original_width, original_height = get_video_resolution(input_video)
+    current_aspect_ratio = original_width / original_height
+    aspect_ratio_diff = abs(current_aspect_ratio - aspect_ratio) / aspect_ratio
+    
+    # If within 20% of target aspect ratio, just copy the original video
+    if aspect_ratio_diff < 0.20:
+        print(f"✅ Video aspect ratio ({current_aspect_ratio:.3f}) is already close to target ({aspect_ratio:.3f})")
+        print("   Copying original video without processing...")
+        shutil.copy2(input_video, final_output_video)
+        print(f"✅ Done! Output saved to: {final_output_video}")
+        return
     
     # Load DNN face detector if requested
     dnn_face_detector = None
@@ -2809,7 +2955,7 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
     fallback_info = f" + {fallback_strategy} fallback" if fallback_strategy != 'letterbox' else ""
     print(f"\n🧠 Step 2: Analyzing scene content (multi-frame sampling: {num_sample_frames} frames/scene{speaker_info}{fallback_info})...")
     step_start_time = time.time()
-    original_width, original_height = get_video_resolution(input_video)
+    # original_width, original_height already obtained above
     
     OUTPUT_HEIGHT = original_height
     OUTPUT_WIDTH = int(OUTPUT_HEIGHT * aspect_ratio)
@@ -2818,6 +2964,7 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
 
     scenes_analysis = []
     speakers_detected = 0
+    conversations_detected = 0
     
     for i, (start_time, end_time) in enumerate(tqdm(scenes, desc="Analyzing Scenes")):
         # Analyze scene content
@@ -2827,10 +2974,11 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
         
         # Detect active speaker if enabled and multiple people
         active_speaker_idx = None
+        is_conversation = False
         speaker_segments = []
         
         if detect_speaker and len(analysis) > 1:
-            active_speaker_idx, _, speaker_segments = detect_active_speaker(
+            active_speaker_idx, is_conversation, speaker_segments = detect_active_speaker(
                 input_video, 
                 start_time.get_frames(), 
                 end_time.get_frames(),
@@ -2841,23 +2989,40 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
             )
             if active_speaker_idx is not None:
                 speakers_detected += 1
+            if is_conversation:
+                conversations_detected += 1
         
-        # Always focus on speaker (no split-screen)
-        strategy, target_box = decide_cropping_strategy(
-            analysis, original_height, original_width, aspect_ratio,
-            active_speaker_idx=active_speaker_idx
-        )
-        
-        # If no people detected (LETTERBOX), try saliency if confident
-        # Otherwise just use letterbox - it's fine for landscapes, B-roll, etc.
-        if strategy == 'LETTERBOX' and fallback_strategy == 'saliency':
-            fallback_box = compute_scene_fallback(
-                input_video, start_time, end_time, aspect_ratio, fallback_strategy
+        # If conversation detected, force STACK strategy (split-screen)
+        if is_conversation and len(analysis) == 2:
+            # Sort people by horizontal position for consistent stacking
+            sorted_people = sorted(analysis, key=lambda x: x['person_box'][0])
+            strategy = 'STACK'
+            target_box = sorted_people
+        else:
+            strategy, target_box = decide_cropping_strategy(
+                analysis, original_height, original_width, aspect_ratio,
+                active_speaker_idx=active_speaker_idx
             )
-            if fallback_box:
-                strategy = 'TRACK'
-                target_box = fallback_box
-            # If saliency not confident, keep LETTERBOX - that's okay
+        
+        # If no people detected (LETTERBOX), ALWAYS try fallback strategy
+        # This ensures we almost never have letterbox unless explicitly requested
+        if strategy == 'LETTERBOX':
+            if fallback_strategy != 'letterbox':
+                fallback_box = compute_scene_fallback(
+                    input_video, start_time, end_time, aspect_ratio, fallback_strategy
+                )
+                if fallback_box:
+                    strategy = 'TRACK'
+                    target_box = fallback_box
+                else:
+                    # Even if saliency fails, use center crop
+                    print(f"  📍 Saliency failed, using center crop")
+                    fallback_box = compute_scene_fallback(
+                        input_video, start_time, end_time, aspect_ratio, 'center'
+                    )
+                    if fallback_box:
+                        strategy = 'TRACK'
+                        target_box = fallback_box
         
         scenes_analysis.append({
             'start_frame': start_time.get_frames(),
@@ -2866,11 +3031,20 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
             'strategy': strategy,
             'target_box': target_box,
             'active_speaker': active_speaker_idx,
+            'is_conversation': is_conversation,
             'speaker_segments': speaker_segments
         })
     
     step_end_time = time.time()
-    speaker_msg = f" ({speakers_detected} scenes with speaker detected)" if detect_speaker and speakers_detected > 0 else ""
+    speaker_msg = ""
+    if detect_speaker:
+        if speakers_detected > 0 or conversations_detected > 0:
+            parts = []
+            if speakers_detected > 0:
+                parts.append(f"{speakers_detected} with single speaker")
+            if conversations_detected > 0:
+                parts.append(f"{conversations_detected} conversations (split-screen)")
+            speaker_msg = f" ({', '.join(parts)})"
     print(f"✅ Scene analysis complete in {step_end_time - step_start_time:.2f}s.{speaker_msg}")
 
     print("\n📋 Step 3: Generated Processing Plan")
@@ -2880,6 +3054,7 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
         start_time = scenes[i][0].get_timecode()
         end_time = scenes[i][1].get_timecode()
         active_speaker = scene_data.get('active_speaker')
+        is_conversation = scene_data.get('is_conversation', False)
         
         # Calculate average confidence for this scene
         if num_people > 0:
@@ -2894,9 +3069,11 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
                 if total_frames > 1:
                     frames_info = f" ({consistent}/{num_people} stable)"
             
-            # Active speaker info
+            # Active speaker / conversation info
             speaker_info = ""
-            if active_speaker is not None:
+            if is_conversation:
+                speaker_info = " 💬CONV"
+            elif active_speaker is not None:
                 speaker_info = f" 🎤P{active_speaker + 1}"
             
             if face_confs:
@@ -2914,9 +3091,7 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
             for j, person in enumerate(scene_data['analysis']):
                 box = person['person_box']
                 box_size = f"{box[2]-box[0]}x{box[3]-box[1]}"
-                face_conf = person.get('face_confidence', 0)
-                face_info = f", face_conf={face_conf:.2f}" if face_conf > 0 else ", no face"
-                print(f"      Person {j+1}: box={box_size}, conf={person['confidence']:.2f}{face_info}")
+                print(f"      Person {j+1}: box={box_size}, conf={person['confidence']:.2f}")
             
             # Show speaker segments in verbose mode
             if scene_data.get('speaker_segments'):
@@ -3209,4 +3384,3 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
     script_end_time = time.time()
     print(f"\n🎉 All done! Final video saved to {final_output_video}")
     print(f"⏱️  Total execution time: {script_end_time - script_start_time:.2f} seconds.")
-
