@@ -2877,6 +2877,37 @@ def get_video_codec(video_path):
         return None
 
 
+# Codecs that OpenCV can't decode properly and need transcoding
+PROBLEMATIC_CODECS = {'av1', 'vp9', 'vp8', 'hevc', 'h265'}
+
+
+def transcode_to_h264(input_path, output_path=None):
+    """
+    Transcode video to H.264 for OpenCV compatibility.
+    Returns the path to the transcoded file.
+    """
+    if output_path is None:
+        output_path = input_path.rsplit('.', 1)[0] + '_h264.mp4'
+    
+    print(f"🔄 Transcoding to H.264 for processing compatibility...")
+    
+    cmd = [
+        'ffmpeg', '-y', '-i', input_path,
+        '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+        '-c:a', 'copy',
+        '-movflags', '+faststart',
+        output_path
+    ]
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        print(f"✅ Transcoding complete")
+        return output_path
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️  Transcoding failed: {e.stderr}")
+        return None
+
+
 def process_video(input_video, final_output_video, model, face_cascade, aspect_ratio=9/16, analysis_scale=1.0, use_gpu=False, confidence_threshold=0.3, use_dnn_face=True, num_sample_frames=3, detect_speaker=True, fallback_strategy='saliency', tracking_mode='smooth', tracking_smoothness=0.08, verbose=False):
     """
     Main video processing function that converts horizontal video to vertical format.
@@ -2913,6 +2944,21 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
         shutil.copy2(input_video, final_output_video)
         print(f"✅ Done! Output saved to: {final_output_video}")
         return
+    
+    # Check if video codec is problematic for OpenCV (AV1, VP9, etc.)
+    transcoded_input = None
+    video_codec = get_video_codec(input_video)
+    if video_codec and video_codec.lower() in PROBLEMATIC_CODECS:
+        print(f"⚠️  Detected {video_codec.upper()} codec - OpenCV cannot decode this properly")
+        base_name = os.path.splitext(final_output_video)[0]
+        transcoded_input = f"{base_name}_transcoded_input.mp4"
+        transcoded_path = transcode_to_h264(input_video, transcoded_input)
+        if transcoded_path:
+            input_video = transcoded_path
+            # Update resolution after transcoding
+            original_width, original_height = get_video_resolution(input_video)
+        else:
+            print("❌ Failed to transcode video. Processing may fail.")
     
     # Load DNN face detector if requested
     dnn_face_detector = None
@@ -3392,3 +3438,7 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
     script_end_time = time.time()
     print(f"\n🎉 All done! Final video saved to {final_output_video}")
     print(f"⏱️  Total execution time: {script_end_time - script_start_time:.2f} seconds.")
+    
+    # Clean up transcoded input file if it was created
+    if transcoded_input and os.path.exists(transcoded_input):
+        os.remove(transcoded_input)
