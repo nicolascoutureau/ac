@@ -1799,6 +1799,14 @@ def detect_scenes(video_path):
     scene_manager.detect_scenes(frame_source=video_manager)
     scene_list = scene_manager.get_scene_list()
     fps = video_manager.get_framerate()
+    
+    # If no scene cuts detected, treat the entire video as a single scene
+    if not scene_list:
+        base_timecode = video_manager.get_base_timecode()
+        end_timecode = video_manager.get_current_timecode()
+        scene_list = [(base_timecode, end_timecode)]
+        print("  ℹ️  No scene cuts detected - treating entire video as one scene")
+    
     video_manager.release()
     return scene_list, fps
 
