@@ -1,11 +1,10 @@
 # Prediction interface for Cog ⚙️
 # https://cog.run/python
-# v2.1 - Speaker detection support
 
 from cog import BasePredictor, Input, Path
 import cv2
 from ultralytics import YOLO
-from autocrop import process_video
+from autocrop import process_video, AUTOCROP_VERSION
 import tempfile
 import os
 import torch
@@ -14,6 +13,9 @@ import torch
 class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
+        print(f"🚀 Autocrop Predictor v{AUTOCROP_VERSION}")
+        print(f"=" * 40)
+        
         try:
             # Detect hardware acceleration availability
             self.has_gpu = torch.cuda.is_available()
@@ -44,6 +46,33 @@ class Predictor(BasePredictor):
                 model.to(self.device)
             
             print(f"  ✅ YOLOv8x (quality), YOLOv8m (balanced), YOLOv8s (fast) loaded on {self.device}")
+            
+            # Load YOLO face model for accurate face detection
+            self.face_model = None
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            face_model_paths = [
+                os.path.join(script_dir, "yolov8n-face.pt"),  # Same directory as predict.py (/src/ on Replicate)
+                "/src/yolov8n-face.pt",  # Replicate container /src/
+                "/root/yolov8n-face.pt",  # Cog build default directory
+                "/yolov8n-face.pt",  # Root directory (Cog may download here)
+                "yolov8n-face.pt",  # Current working directory
+            ]
+            
+            print(f"Looking for YOLO face model (script_dir: {script_dir})...")
+            for face_model_path in face_model_paths:
+                print(f"  Checking: {face_model_path} ... ", end="")
+                if os.path.exists(face_model_path):
+                    print("FOUND!")
+                    print(f"Loading YOLO face model from {face_model_path}...")
+                    self.face_model = YOLO(face_model_path)
+                    self.face_model.to(self.device)
+                    print(f"  ✅ YOLOv8n-face loaded on {self.device}")
+                    break
+                else:
+                    print("not found")
+            
+            if self.face_model is None:
+                print(f"  ⚠️  YOLO face model not found in any location, will use face estimation from person boxes")
             
             print("Loading Haar Cascade face detector...")
             self.face_cascade = cv2.CascadeClassifier(
@@ -103,10 +132,11 @@ class Predictor(BasePredictor):
             print(f"  Using: {model_names[speed_preset]}")
             
             # Set analysis resolution based on preset
+            # With L40S GPUs, we can afford higher resolution analysis
             analysis_scale = {
                 'quality': 1.0,    # Full resolution
-                'balanced': 0.75,  # 75% resolution for analysis
-                'fast': 0.5        # 50% resolution for analysis
+                'balanced': 1.0,   # Full resolution (L40S can handle it)
+                'fast': 0.75       # 75% resolution for analysis
             }
             
             # Create a temporary output file
@@ -132,7 +162,8 @@ class Predictor(BasePredictor):
                 analysis_scale=analysis_scale[speed_preset],
                 use_gpu=self.has_gpu,
                 detect_speaker=detect_speaker,
-                tracking_mode=tracking_mode
+                tracking_mode=tracking_mode,
+                face_model=self.face_model  # Pass pre-loaded face model
             )
             
             # Verify output was created

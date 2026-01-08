@@ -14,6 +14,9 @@ import urllib.request
 import tempfile
 import sys
 
+# Version tracking for Replicate deployment
+AUTOCROP_VERSION = "0.5"
+
 # TalkNet integration for audio-visual active speaker detection
 # Source: https://github.com/TaoRuijie/TalkNet-ASD
 TALKNET_AVAILABLE = False
@@ -1437,46 +1440,127 @@ def analyze_scene_with_speaker_detection(video_path, scene_start_time, scene_end
     return detections, active_speaker, is_conversation, segments
 
 
-def load_dnn_face_detector():
+def load_yolo_face_detector():
     """
-    Load OpenCV DNN face detector with Caffe model.
-    Downloads model files if not present.
+    Load YOLO face detector model if available.
+    Falls back to face estimation from person boxes if no face model found.
     
     Returns:
-        cv2.dnn.Net or None if loading fails
+        YOLO model for face detection, or None to use estimation
     """
-    # Model files
-    prototxt_path = os.path.join(os.path.dirname(__file__), "deploy.prototxt")
-    model_path = os.path.join(os.path.dirname(__file__), "res10_300x300_ssd_iter_140000.caffemodel")
-    
-    # URLs for model files
-    prototxt_url = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
-    model_url = "https://github.com/opencv/opencv_3rdparty/raw/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
-    
     try:
-        # Download prototxt if missing
-        if not os.path.exists(prototxt_path):
-            print("📥 Downloading DNN face detector prototxt...")
-            urllib.request.urlretrieve(prototxt_url, prototxt_path)
+        from ultralytics import YOLO
+        import torch
         
-        # Download model if missing
-        if not os.path.exists(model_path):
-            print("📥 Downloading DNN face detector model (~10MB)...")
-            urllib.request.urlretrieve(model_url, model_path)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
         
-        # Load the network
-        net = cv2.dnn.readNetFromCaffe(prototxt_path, model_path)
-        print("✅ DNN face detector loaded (provides confidence scores)")
-        return net
-    except Exception as e:
-        print(f"⚠️  Could not load DNN face detector: {e}")
-        print("   Falling back to Haar Cascade (no confidence scores)")
+        # Check for YOLO face model in common locations
+        face_model_paths = [
+            os.path.join(script_dir, "yolov8n-face.pt"),  # Same dir as autocrop.py
+            "/src/yolov8n-face.pt",  # Replicate container /src/
+            "yolov8n-face.pt",  # Current working directory
+            os.path.join(script_dir, "yolov8s-face.pt"),
+            os.path.join(script_dir, "models", "yolov8n-face.pt"),
+        ]
+        
+        for model_path in face_model_paths:
+            if os.path.exists(model_path):
+                print(f"✅ Loading YOLO face model: {model_path}")
+                model = YOLO(model_path)
+                # Move to GPU if available
+                if torch.cuda.is_available():
+                    model.to('cuda')
+                    print(f"  🚀 Face model on GPU: {torch.cuda.get_device_name(0)}")
+                return model
+        
+        # No dedicated face model found - will use estimation from person boxes
+        print("ℹ️  No YOLO face model found, using face estimation from person boxes")
         return None
+        
+    except Exception as e:
+        print(f"⚠️  Could not load YOLO face detector: {e}")
+        return None
+
+
+def estimate_face_from_person(person_box, frame_height, frame_width):
+    """
+    Estimate face bounding box from person bounding box.
+    Works well for talking head / upper body shots.
+    
+    Args:
+        person_box: Person bounding box [x1, y1, x2, y2]
+        frame_height: Frame height for validation
+        frame_width: Frame width for validation
+        
+    Returns:
+        Tuple of (face_box, confidence) or (None, 0) if estimation fails
+    """
+    x1, y1, x2, y2 = person_box
+    person_width = x2 - x1
+    person_height = y2 - y1
+    
+    if person_height <= 0 or person_width <= 0:
+        return None, 0.0
+    
+    # Estimate face position based on person box
+    # Face is typically in the upper 25-35% of person box, centered horizontally
+    
+    # Calculate aspect ratio to determine shot type
+    aspect = person_height / person_width if person_width > 0 else 1.0
+    
+    if aspect > 2.5:
+        # Full body shot - face is small, in upper 15-20%
+        face_top_ratio = 0.02
+        face_bottom_ratio = 0.18
+        face_width_ratio = 0.4
+        confidence = 0.6  # Lower confidence for full body
+    elif aspect > 1.5:
+        # Medium shot - face in upper 25-35%
+        face_top_ratio = 0.02
+        face_bottom_ratio = 0.30
+        face_width_ratio = 0.5
+        confidence = 0.75
+    else:
+        # Close-up / head shot - face fills more of the box
+        face_top_ratio = 0.05
+        face_bottom_ratio = 0.55
+        face_width_ratio = 0.7
+        confidence = 0.85
+    
+    # Calculate face box
+    face_height = person_height * (face_bottom_ratio - face_top_ratio)
+    face_width = min(person_width * face_width_ratio, face_height * 0.8)  # Face aspect ~0.7-0.8
+    
+    face_center_x = (x1 + x2) / 2
+    face_top = y1 + person_height * face_top_ratio
+    
+    face_x1 = int(face_center_x - face_width / 2)
+    face_y1 = int(face_top)
+    face_x2 = int(face_center_x + face_width / 2)
+    face_y2 = int(face_top + face_height)
+    
+    # Clamp to frame bounds
+    face_x1 = max(0, min(face_x1, frame_width - 1))
+    face_y1 = max(0, min(face_y1, frame_height - 1))
+    face_x2 = max(face_x1 + 1, min(face_x2, frame_width))
+    face_y2 = max(face_y1 + 1, min(face_y2, frame_height))
+    
+    face_box = [face_x1, face_y1, face_x2, face_y2]
+    
+    return face_box, confidence
+
+
+# Keep old function name for compatibility but redirect to new implementation
+def load_dnn_face_detector():
+    """
+    Legacy function - now loads YOLO face detector or returns None for estimation.
+    """
+    return load_yolo_face_detector()
 
 def compute_saliency_region(frame, aspect_ratio, padding_factor=1.5):
     """
-    Compute the most salient (visually interesting) region in a frame.
-    Uses OpenCV's Spectral Residual saliency detection.
+    Compute the most visually interesting region in a frame.
+    Uses edge detection and gradient magnitude (works without opencv-contrib).
     
     Args:
         frame: Input frame (BGR)
@@ -1484,78 +1568,79 @@ def compute_saliency_region(frame, aspect_ratio, padding_factor=1.5):
         padding_factor: How much padding around salient region (1.5 = 50% padding)
         
     Returns:
-        Bounding box [x1, y1, x2, y2] of the most salient region, or None if failed
+        Bounding box [x1, y1, x2, y2] of the most interesting region, or None if failed
     """
     try:
         frame_height, frame_width = frame.shape[:2]
         
-        # Create saliency detector
-        saliency = cv2.saliency.StaticSaliencySpectralResidual_create()
+        # Convert to grayscale
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Compute saliency map
-        success, saliency_map = saliency.computeSaliency(frame)
+        # Compute gradient magnitude using Sobel operators
+        grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        gradient_mag = np.sqrt(grad_x**2 + grad_y**2)
         
-        if not success or saliency_map is None:
-            return None
+        # Normalize to 0-255
+        gradient_mag = (gradient_mag / gradient_mag.max() * 255).astype(np.uint8)
         
-        # Normalize saliency map to 0-255
-        saliency_map = (saliency_map * 255).astype(np.uint8)
+        # Apply Gaussian blur to smooth
+        gradient_mag = cv2.GaussianBlur(gradient_mag, (31, 31), 0)
         
-        # Apply Gaussian blur to smooth the map
-        saliency_map = cv2.GaussianBlur(saliency_map, (25, 25), 0)
+        # Threshold to find high-detail regions (top 25% most detailed)
+        threshold = np.percentile(gradient_mag, 75)
+        _, binary_map = cv2.threshold(gradient_mag, threshold, 255, cv2.THRESH_BINARY)
         
-        # Threshold to find salient regions (top 20% most salient)
-        threshold = np.percentile(saliency_map, 80)
-        _, binary_map = cv2.threshold(saliency_map, threshold, 255, cv2.THRESH_BINARY)
-        
-        # Find contours of salient regions
+        # Find contours of interesting regions
         contours, _ = cv2.findContours(binary_map, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         if not contours:
-            # No distinct salient region - use center of mass of saliency
-            moments = cv2.moments(saliency_map)
+            # No distinct region - use weighted center of gradient magnitude
+            moments = cv2.moments(gradient_mag)
             if moments['m00'] > 0:
                 cx = int(moments['m10'] / moments['m00'])
                 cy = int(moments['m01'] / moments['m00'])
             else:
                 # Fallback to center
                 cx, cy = frame_width // 2, frame_height // 2
-            
-            # Create a region around center of mass
-            region_height = frame_height // 3
-            region_width = int(region_height * aspect_ratio)
-            
-            x1 = max(0, cx - region_width // 2)
-            y1 = max(0, cy - region_height // 2)
-            x2 = min(frame_width, x1 + region_width)
-            y2 = min(frame_height, y1 + region_height)
-            
-            return [x1, y1, x2, y2]
+        else:
+            # Get bounding box of all interesting contours combined
+            all_points = np.vstack(contours)
+            x, y, w, h = cv2.boundingRect(all_points)
+            cx = x + w // 2
+            cy = y + h // 2
         
-        # Get bounding box of all salient contours combined
-        all_points = np.vstack(contours)
-        x, y, w, h = cv2.boundingRect(all_points)
+        # Create crop region centered on the interesting area
+        crop_height = frame_height
+        crop_width = int(crop_height * aspect_ratio)
         
-        # Add padding around the salient region
-        center_x = x + w // 2
-        center_y = y + h // 2
+        # Constrain to frame
+        if crop_width > frame_width:
+            crop_width = frame_width
+            crop_height = int(crop_width / aspect_ratio)
         
-        padded_w = int(w * padding_factor)
-        padded_h = int(h * padding_factor)
+        # Center on the interesting point
+        x1 = cx - crop_width // 2
+        y1 = cy - crop_height // 2
         
-        # Ensure minimum size (at least 30% of frame)
-        padded_w = max(padded_w, int(frame_width * 0.3))
-        padded_h = max(padded_h, int(frame_height * 0.3))
+        # Shift to keep within bounds
+        if x1 < 0:
+            x1 = 0
+        elif x1 + crop_width > frame_width:
+            x1 = frame_width - crop_width
         
-        x1 = max(0, center_x - padded_w // 2)
-        y1 = max(0, center_y - padded_h // 2)
-        x2 = min(frame_width, center_x + padded_w // 2)
-        y2 = min(frame_height, center_y + padded_h // 2)
+        if y1 < 0:
+            y1 = 0
+        elif y1 + crop_height > frame_height:
+            y1 = frame_height - crop_height
         
-        return [x1, y1, x2, y2]
+        x2 = x1 + crop_width
+        y2 = y1 + crop_height
+        
+        return [int(x1), int(y1), int(x2), int(y2)]
         
     except Exception as e:
-        print(f"  ⚠️  Saliency detection failed: {e}")
+        print(f"  ⚠️  Interest detection failed: {e}")
         return None
 
 
@@ -1584,13 +1669,13 @@ def get_center_crop_box(frame_width, frame_height, aspect_ratio):
         return [0, y1, frame_width, y1 + target_height]
 
 
-def detect_face_dnn(frame, face_net, person_box=None, min_confidence=0.5):
+def detect_face_yolo(frame, face_model, person_box=None, min_confidence=0.5):
     """
-    Detect faces using OpenCV DNN face detector with confidence scores.
+    Detect faces using YOLO face model with confidence scores.
     
     Args:
         frame: Input frame (BGR)
-        face_net: OpenCV DNN face detection network
+        face_model: YOLO face detection model
         person_box: Optional [x1, y1, x2, y2] to restrict search area
         min_confidence: Minimum confidence threshold for face detection
         
@@ -1609,28 +1694,50 @@ def detect_face_dnn(frame, face_net, person_box=None, min_confidence=0.5):
     if h == 0 or w == 0:
         return []
     
-    # Create blob for DNN
-    blob = cv2.dnn.blobFromImage(roi, 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=False, crop=False)
-    face_net.setInput(blob)
-    detections = face_net.forward()
+    # Run YOLO face detection
+    results = face_model([roi], verbose=False)
     
     faces = []
-    for i in range(detections.shape[2]):
-        confidence = detections[0, 0, i, 2]
-        if confidence > min_confidence:
-            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-            fx1, fy1, fx2, fy2 = box.astype(int)
-            
-            # Offset back to full frame coordinates
-            face_box = [
-                max(0, fx1 + offset_x),
-                max(0, fy1 + offset_y),
-                fx2 + offset_x,
-                fy2 + offset_y
-            ]
-            faces.append((face_box, float(confidence)))
+    for result in results:
+        boxes = result.boxes
+        for box in boxes:
+            confidence = float(box.conf[0])
+            if confidence > min_confidence:
+                fx1, fy1, fx2, fy2 = [int(i) for i in box.xyxy[0]]
+                
+                # Offset back to full frame coordinates
+                face_box = [
+                    max(0, fx1 + offset_x),
+                    max(0, fy1 + offset_y),
+                    fx2 + offset_x,
+                    fy2 + offset_y
+                ]
+                faces.append((face_box, float(confidence)))
     
     return faces
+
+
+# Keep old function name for compatibility
+def detect_face_dnn(frame, face_detector, person_box=None, min_confidence=0.5):
+    """
+    Unified face detection - uses YOLO if model provided, otherwise estimates from person box.
+    """
+    frame_height, frame_width = frame.shape[:2]
+    
+    # If we have a YOLO face model, use it
+    if face_detector is not None:
+        try:
+            return detect_face_yolo(frame, face_detector, person_box, min_confidence)
+        except:
+            pass
+    
+    # Fallback: estimate face from person box
+    if person_box is not None:
+        face_box, confidence = estimate_face_from_person(person_box, frame_height, frame_width)
+        if face_box is not None and confidence >= min_confidence:
+            return [(face_box, confidence)]
+    
+    return []
 
 
 def analyze_single_frame(frame, model, face_cascade, dnn_face_detector, analysis_scale, confidence_threshold):
@@ -1687,18 +1794,30 @@ def analyze_single_frame(frame, model, face_cascade, dnn_face_detector, analysis
                 face_confidence = 0.0
                 
                 if dnn_face_detector is not None:
+                    # Use YOLO face model if available
                     faces = detect_face_dnn(frame, dnn_face_detector, person_box, min_confidence=0.5)
                     if faces:
                         faces.sort(key=lambda x: x[1], reverse=True)
                         face_box, face_confidence = faces[0]
                 else:
-                    person_roi_gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
-                    faces = face_cascade.detectMultiScale(person_roi_gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+                    # Estimate face from person bounding box (faster, no extra model needed)
+                    face_box, face_confidence = estimate_face_from_person(
+                        person_box, frame_height, frame_width
+                    )
                     
-                    if len(faces) > 0:
-                        fx, fy, fw, fh = faces[0]
-                        face_box = [x1 + fx, y1 + fy, x1 + fx + fw, y1 + fy + fh]
-                        face_confidence = 0.8
+                    # If estimation confidence is low, try Haar cascade as fallback
+                    if face_confidence < 0.7 and face_cascade is not None:
+                        try:
+                            person_roi_gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+                            haar_faces = face_cascade.detectMultiScale(
+                                person_roi_gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
+                            )
+                            if len(haar_faces) > 0:
+                                fx, fy, fw, fh = haar_faces[0]
+                                face_box = [x1 + fx, y1 + fy, x1 + fx + fw, y1 + fy + fh]
+                                face_confidence = 0.8
+                        except:
+                            pass  # Keep estimation result
 
                 detected_objects.append({
                     'person_box': person_box, 
@@ -2716,26 +2835,80 @@ def create_stacked_frame(frame, people_data, output_width, output_height, aspect
 class SmoothTracker:
     """
     Smooth tracking system for OpusClip-like camera movement.
-    Applies exponential smoothing to follow subjects smoothly.
+    Uses dead zone + adaptive smoothing to avoid jitter from small movements.
+    Only follows when subject moves significantly.
     """
     
-    def __init__(self, smoothing=0.08):
+    def __init__(self, smoothing=0.08, dead_zone_ratio=0.03):
         """
         Args:
-            smoothing: Lower = smoother/slower (0.05-0.15 recommended)
+            smoothing: Base smoothing factor (0.05-0.15 recommended)
+            dead_zone_ratio: Fraction of frame width/height to ignore as dead zone (default 3%)
         """
-        self.smoothing = smoothing
+        self.base_smoothing = smoothing
+        self.dead_zone_ratio = dead_zone_ratio
         self.current_x = None
         self.current_y = None
+        self.target_x = None  # Smoothed target (not actual position)
+        self.target_y = None
+        self.frame_width = 1920  # Will be updated on first use
+        self.frame_height = 1080
+    
+    def set_frame_size(self, width, height):
+        """Set frame dimensions for dead zone calculation."""
+        self.frame_width = width
+        self.frame_height = height
     
     def update(self, target_x, target_y):
         """Update tracker with new target position, returns smoothed position."""
         if self.current_x is None:
             self.current_x = target_x
             self.current_y = target_y
-        else:
-            self.current_x += self.smoothing * (target_x - self.current_x)
-            self.current_y += self.smoothing * (target_y - self.current_y)
+            self.target_x = target_x
+            self.target_y = target_y
+            return self.current_x, self.current_y
+        
+        # Calculate dead zone thresholds (% of frame size)
+        dead_zone_x = self.frame_width * self.dead_zone_ratio
+        dead_zone_y = self.frame_height * self.dead_zone_ratio
+        
+        # Calculate distance from current smoothed target to new target
+        dx = target_x - self.target_x
+        dy = target_y - self.target_y
+        
+        # Only update target if movement exceeds dead zone
+        # This prevents camera from chasing every micro-movement
+        if abs(dx) > dead_zone_x:
+            # Move target, but keep it slightly inside the dead zone
+            # This creates a "lazy follow" effect
+            if dx > 0:
+                self.target_x = target_x - dead_zone_x * 0.5
+            else:
+                self.target_x = target_x + dead_zone_x * 0.5
+        
+        if abs(dy) > dead_zone_y:
+            if dy > 0:
+                self.target_y = target_y - dead_zone_y * 0.5
+            else:
+                self.target_y = target_y + dead_zone_y * 0.5
+        
+        # Calculate distance for adaptive smoothing
+        dist_to_target = ((self.target_x - self.current_x) ** 2 + 
+                          (self.target_y - self.current_y) ** 2) ** 0.5
+        
+        # Adaptive smoothing: slower for small movements, faster for large
+        # This prevents overshooting on small adjustments
+        frame_diagonal = (self.frame_width ** 2 + self.frame_height ** 2) ** 0.5
+        movement_ratio = dist_to_target / frame_diagonal
+        
+        # Scale smoothing: very slow for tiny movements, up to base for large movements
+        # min 0.02 (very slow), max = base_smoothing
+        adaptive_smoothing = self.base_smoothing * min(1.0, movement_ratio * 10)
+        adaptive_smoothing = max(0.02, adaptive_smoothing)
+        
+        # Apply smoothing to move toward target
+        self.current_x += adaptive_smoothing * (self.target_x - self.current_x)
+        self.current_y += adaptive_smoothing * (self.target_y - self.current_y)
         
         return self.current_x, self.current_y
     
@@ -2743,11 +2916,15 @@ class SmoothTracker:
         """Reset tracker state."""
         self.current_x = None
         self.current_y = None
+        self.target_x = None
+        self.target_y = None
     
     def snap_to(self, x, y):
         """Instantly snap to position (for scene changes)."""
         self.current_x = x
         self.current_y = y
+        self.target_x = x
+        self.target_y = y
 
 
 def track_subjects_in_frame(frame, model, previous_boxes=None, confidence_threshold=0.25):
@@ -2908,7 +3085,7 @@ def transcode_to_h264(input_path, output_path=None):
         return None
 
 
-def process_video(input_video, final_output_video, model, face_cascade, aspect_ratio=9/16, analysis_scale=1.0, use_gpu=False, confidence_threshold=0.3, use_dnn_face=True, num_sample_frames=3, detect_speaker=True, fallback_strategy='saliency', tracking_mode='smooth', tracking_smoothness=0.08, verbose=False):
+def process_video(input_video, final_output_video, model, face_cascade, aspect_ratio=9/16, analysis_scale=1.0, use_gpu=False, confidence_threshold=0.3, use_dnn_face=True, num_sample_frames=3, detect_speaker=True, fallback_strategy='saliency', tracking_mode='smooth', tracking_smoothness=0.08, verbose=False, face_model=None):
     """
     Main video processing function that converts horizontal video to vertical format.
     OpusClip-like quality with smooth tracking and real-time subject following.
@@ -2922,15 +3099,19 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
         analysis_scale: Scale factor for scene analysis (e.g., 0.5 = half resolution for faster processing)
         use_gpu: Whether GPU is available for hardware acceleration
         confidence_threshold: Minimum confidence (0-1) for person detection. Default: 0.3 (lowered for better recall)
-        use_dnn_face: Whether to use DNN face detector for confidence scores. Default: True
+        use_dnn_face: Whether to use enhanced face detection (YOLO face model if available, or estimation from person boxes). Default: True
         num_sample_frames: Number of frames to sample per scene for detection (default: 3). More = better accuracy, slower.
         detect_speaker: Whether to detect and focus on active speaker (default: True). Analyzes lip movement.
         fallback_strategy: Strategy when no people detected ('saliency', 'center', 'letterbox'). Default: 'saliency'
         tracking_mode: 'smooth' (real-time tracking with smoothing), 'static' (per-scene), 'fast' (real-time, less smooth). Default: 'smooth'
         tracking_smoothness: Camera smoothness (0.05=very smooth, 0.15=responsive). Default: 0.08
         verbose: Show detailed debug info for each scene. Default: False
+        face_model: Pre-loaded YOLO face model (optional). If None and use_dnn_face=True, will try to load one.
     """
     script_start_time = time.time()
+    
+    print(f"🎬 Autocrop v{AUTOCROP_VERSION}")
+    print(f"=" * 40)
     
     # Check if video is already close to the target aspect ratio
     original_width, original_height = get_video_resolution(input_video)
@@ -2960,10 +3141,15 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
         else:
             print("❌ Failed to transcode video. Processing may fail.")
     
-    # Load DNN face detector if requested
+    # Load face detector (YOLO face model if available, otherwise uses estimation from person boxes)
     dnn_face_detector = None
     if use_dnn_face:
-        dnn_face_detector = load_dnn_face_detector()
+        if face_model is not None:
+            # Use pre-loaded face model (faster, avoids reloading)
+            dnn_face_detector = face_model
+            print("✅ Using pre-loaded YOLO face model")
+        else:
+            dnn_face_detector = load_yolo_face_detector()
     
     # Initialize TalkNet for speaker detection
     if detect_speaker:
@@ -3245,10 +3431,17 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
     use_realtime = tracking_mode in ['smooth', 'fast']
     smoothness = tracking_smoothness if tracking_mode == 'smooth' else 0.2
     tracker = SmoothTracker(smoothing=smoothness)
+    tracker.set_frame_size(original_width, original_height)
     
     # For real-time tracking
     previous_detections = None
-    track_interval = 3 if tracking_mode == 'smooth' else 6  # Detect every N frames
+    # Track interval: detect every N frames
+    # With GPU (L40S), we can track more frequently for better responsiveness
+    # Without GPU, track less often to save CPU
+    if use_gpu:
+        track_interval = 2 if tracking_mode == 'smooth' else 4  # GPU: more frequent tracking
+    else:
+        track_interval = 5 if tracking_mode == 'smooth' else 8  # CPU: less frequent
     last_detected_box = None
     
     # Pre-allocate letterbox frame to avoid repeated allocations
@@ -3259,7 +3452,8 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
         'fast': '⚡ Fast tracking',
         'static': '📌 Static per-scene'
     }
-    print(f"  {mode_desc.get(tracking_mode, '📌 Static')}...")
+    gpu_info = f" (GPU: every {track_interval} frames)" if use_gpu else f" (CPU: every {track_interval} frames)"
+    print(f"  {mode_desc.get(tracking_mode, '📌 Static')}{gpu_info if use_realtime else ''}...")
     
     with tqdm(total=total_frames, desc="Processing", smoothing=0.1) as pbar:
         while cap.isOpened():

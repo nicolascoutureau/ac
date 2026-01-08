@@ -1,4 +1,4 @@
-opencv-contrib-python-headless==4.8.1.78
+opencv-python-headless==4.8.1.78
 scenedetect[opencv]==0.6.2
 ultralytics==8.0.196
 torch==2.1.0
