@@ -15,7 +15,7 @@ import tempfile
 import sys
 
 # Version tracking for Replicate deployment
-AUTOCROP_VERSION = "0.18"
+AUTOCROP_VERSION = "0.19"
 
 # ============= Fast Speaker Detection (MediaPipe) =============
 # Uses MediaPipe Face Mesh for real-time lip tracking + WebRTC VAD for audio
@@ -2199,12 +2199,14 @@ def process_video(input_video, final_output_video, model, face_cascade, aspect_r
                 conversations_detected += 1
         
         # Decide cropping strategy
-        # Conversations use letterbox to show both people
+        # Conversations: track the GROUP of speakers (zoomed in, not letterbox)
         if is_conversation and len(analysis) >= 2:
-            # Conversation detected - use letterbox to show everyone
-            print(f"  💬 Conversation: using letterbox to show both speakers")
-            strategy = 'LETTERBOX'
-            target_box = None
+            # Create a box that encompasses all detected people
+            all_boxes = [p['person_box'] for p in analysis]
+            group_box = get_enclosing_box(all_boxes)
+            print(f"  💬 Conversation: tracking group of {len(analysis)} people")
+            strategy = 'TRACK'
+            target_box = group_box
         elif active_speaker_idx is not None:
             # Clear speaker detected - focus on them
             strategy, target_box = decide_cropping_strategy(

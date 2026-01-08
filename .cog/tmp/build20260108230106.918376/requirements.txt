@@ -1,0 +1,10 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+opencv-python-headless==4.8.1.78
+scenedetect[opencv]==0.6.2
+ultralytics==8.0.196
+torch==2.1.0
+torchvision==0.16.0
+tqdm==4.66.1
+numpy==1.24.3
+mediapipe==0.10.9
+webrtcvad>=2.0.10
