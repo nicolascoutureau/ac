@@ -112,7 +112,7 @@ class Predictor(BasePredictor):
             default="balanced"
         ),
         detect_speaker: bool = Input(
-            description="Detect and focus on the active speaker using TalkNet AI. When multiple people are detected, focuses on who is speaking instead of split-screen. WARNING: This is slow.",
+            description="Detect and focus on the active speaker using fast lip tracking. When multiple people are detected, focuses on who is talking.",
             default=False
         ),
         tracking_mode: str = Input(
@@ -129,7 +129,7 @@ class Predictor(BasePredictor):
             print(f"  Input: {video}")
             print(f"  Aspect ratio: {aspect_ratio}")
             print(f"  Speed preset: {speed_preset}")
-            print(f"  Speaker detection: {'TalkNet (local)' if detect_speaker else 'Disabled'}")
+            print(f"  Speaker detection: {'MediaPipe (fast)' if detect_speaker else 'Disabled'}")
             print(f"  Tracking mode: {tracking_mode}")
             
             # Select model based on speed preset
