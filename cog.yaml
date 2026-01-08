@@ -23,7 +23,7 @@ build:
   # Pre-download all YOLO models during build to avoid setup timeouts
   run:
     - 'python -c ''from ultralytics import YOLO; print("Downloading YOLO models..."); YOLO("yolov8x.pt"); YOLO("yolov8m.pt"); YOLO("yolov8s.pt"); print("All models downloaded!")'''
-    - 'curl -L -o yolov8n-face.pt "https://github.com/akanametov/yolov8-face/releases/download/v0.0.0/yolov8n-face.pt" && ls -la yolov8n-face.pt && echo "✅ YOLO face model downloaded"'
+    - 'curl -L -o yolov8n-face.pt "https://github.com/YapaLab/yolo-face/releases/download/1.0.0/yolov8n-face.pt" && ls -la yolov8n-face.pt && echo "✅ YOLO face model downloaded (6.09 MB expected)"'
 
 # predict.py defines how predictions are run on your model
 predict: "predict.py:Predictor"

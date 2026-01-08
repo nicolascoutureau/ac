@@ -62,17 +62,27 @@ class Predictor(BasePredictor):
             for face_model_path in face_model_paths:
                 print(f"  Checking: {face_model_path} ... ", end="")
                 if os.path.exists(face_model_path):
-                    print("FOUND!")
-                    print(f"Loading YOLO face model from {face_model_path}...")
-                    self.face_model = YOLO(face_model_path)
-                    self.face_model.to(self.device)
-                    print(f"  ✅ YOLOv8n-face loaded on {self.device}")
-                    break
+                    # Check file size - yolov8n-face.pt should be ~6MB
+                    file_size = os.path.getsize(face_model_path)
+                    print(f"FOUND! ({file_size / 1024 / 1024:.2f} MB)")
+                    if file_size < 1_000_000:  # Less than 1MB is likely corrupted
+                        print(f"  ⚠️  File too small, likely corrupted (expected ~6MB). Skipping.")
+                        continue
+                    try:
+                        print(f"Loading YOLO face model from {face_model_path}...")
+                        self.face_model = YOLO(face_model_path)
+                        self.face_model.to(self.device)
+                        print(f"  ✅ YOLOv8n-face loaded on {self.device}")
+                        break
+                    except Exception as e:
+                        print(f"  ⚠️  Failed to load face model: {e}. Trying next path...")
+                        self.face_model = None
+                        continue
                 else:
                     print("not found")
             
             if self.face_model is None:
-                print(f"  ⚠️  YOLO face model not found in any location, will use face estimation from person boxes")
+                print(f"  ⚠️  YOLO face model not available, will use face estimation from person boxes")
             
             print("Loading Haar Cascade face detector...")
             self.face_cascade = cv2.CascadeClassifier(

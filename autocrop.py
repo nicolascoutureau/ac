@@ -15,7 +15,7 @@ import tempfile
 import sys
 
 # Version tracking for Replicate deployment
-AUTOCROP_VERSION = "0.5"
+AUTOCROP_VERSION = "0.6"
 
 # TalkNet integration for audio-visual active speaker detection
 # Source: https://github.com/TaoRuijie/TalkNet-ASD
